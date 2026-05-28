@@ -35,8 +35,9 @@ const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS || '180000', 10);
 
 // ───────────────────────── Helpers ─────────────────────────
 const safeRead = (p) => { try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; } };
-const today = () => new Date().toISOString().slice(0, 10);
-const nowTs = () => new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16);
+// Connect AI daily logs use Asia/Seoul because the operator's workday is KST.
+const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Seoul" });
+const nowTs = () => new Date().toLocaleString("sv-SE", { timeZone: "Asia/Seoul", hour12: false }).replace(" ", "T").replace(/:/g, "-").slice(0, 16);
 
 async function detectEngine() {
     try { await axios.get(`${OLLAMA_URL}/api/tags`, { timeout: 1500 }); return { kind: 'ollama', url: OLLAMA_URL }; } catch {}
@@ -62,6 +63,8 @@ async function callLLM(engine, system, user) {
 
 // ───────────────────────── Cycle body ─────────────────────────
 async function runCycle() {
+    const cycleDate = today(); // Cache once to avoid midnight boundary drift inside one run.
+    const cycleTime = new Date().toLocaleTimeString('ko-KR', { timeZone: "Asia/Seoul", hour:'2-digit',minute:'2-digit' });
     if (!fs.existsSync(path.join(BRAIN_DIR, '_shared'))) {
         console.error(`✗ Brain folder not initialized at ${BRAIN_DIR}. Open the IDE extension once to set up.`);
         process.exit(1);
@@ -86,7 +89,7 @@ ${decisions}
 
 지금 가장 가치 있는 작업 1개를 선택해서 직접 수행하세요. 출력은 마크다운으로:
 
-# 🌙 자율 사이클 — ${today()} ${new Date().toLocaleTimeString('ko-KR', {hour:'2-digit',minute:'2-digit'})}
+# 🌙 자율 사이클 — ${cycleDate} ${cycleTime}
 
 ## 선택한 작업
 (왜 이 작업이 가장 가치 있는지)
@@ -111,11 +114,11 @@ ${decisions}
     // Append to daily conversation log so the IDE-side timeline picks it up
     const convDir = path.join(BRAIN_DIR, '00_Raw', 'conversations');
     fs.mkdirSync(convDir, { recursive: true });
-    const dayFile = path.join(convDir, `${today()}.md`);
+    const dayFile = path.join(convDir, `${cycleDate}.md`);
     if (!fs.existsSync(dayFile)) {
-        fs.writeFileSync(dayFile, `# 📜 ${today()} 회사 대화록\n\n_모든 명령·분배·산출물·대화가 시간순으로 누적됩니다._\n`);
+        fs.writeFileSync(dayFile, `# 📜 ${cycleDate} 회사 대화록\n\n_모든 명령·분배·산출물·대화가 시간순으로 누적됩니다._\n`);
     }
-    const ts = new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    const ts = new Date().toLocaleTimeString('ko-KR', { timeZone: "Asia/Seoul", hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
     const block = `\n## [${ts}] 🌙 **자율 사이클** · _IDE 외부_\n\n${out}\n`;
     fs.appendFileSync(dayFile, block);
 
@@ -151,7 +154,7 @@ runCycle().catch((e) => {
 # Then: launchctl load ~/Library/LaunchAgents/com.connectai.cycle.plist
 
 # Linux/macOS cron — every 30 minutes
-# */30 * * * * /usr/local/bin/node /path/to/cycle.js >> ~/.connect-ai-brain/cycle.log 2>&1
+# 0,30 * * * * /usr/local/bin/node /path/to/cycle.js >> ~/.connect-ai-brain/cycle.log 2>&1
 
 # Windows Task Scheduler — create a task that runs node.exe with this script as arg
 # every 30 min, with working directory set to the brain folder.

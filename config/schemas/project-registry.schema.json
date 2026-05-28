@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "project-registry",
+  "type": "object",
+  "required": ["version", "departments"],
+  "properties": {
+    "version": { "type": "integer" },
+    "description": { "type": "string" },
+    "departments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "root", "risk", "mutable", "approvalRequiredForRun"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+          "name": { "type": "string" },
+          "role": { "type": "string" },
+          "root": { "type": "string" },
+          "risk": { "enum": ["low", "medium", "high"] },
+          "mutable": { "const": false },
+          "approvalRequiredForRun": { "type": "boolean" },
+          "modelTier": { "type": "string" },
+          "largeModelApproved": { "type": "boolean" },
+          "statusCommands": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "command"],
+              "properties": {
+                "id": { "type": "string" },
+                "cwd": { "type": "string" },
+                "command": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
+          },
+          "outputs": { "type": "array", "items": { "type": "string" } },
+          "boundaries": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": false
+}

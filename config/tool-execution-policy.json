@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "description": "Tool execution policy for Hermes-orchestrated multi-agent work. Goal: MAXIMIZE auto-run, MINIMIZE human approvals. Approval interrupts you ONLY for genuinely dangerous (irreversible / exfiltrating / financial / external-send) actions. Everything safe and reversible runs automatically.",
+  "mutable": false,
+  "owner": "Claude (brain) designs; Codex (hands) implements into antigravity-projects/connect-ai/config and wires the policy-gate. Do not auto-apply to real repo.",
+
+  "principle": {
+    "autoIf": "reversible AND non-exfiltrating AND on the allowlist AND within budget",
+    "gateIf": "irreversible OR leaves this machine OR touches secrets/credentials OR money-adjacent OR mutates outside the sandbox",
+    "forbiddenAlways": "destructive, financial-execution, secret-output, access/permission changes — blocked even if approved",
+    "note": "Approvals are kept small ON PURPOSE. The way we automate 'most work' is by widening the auto allowlist of SAFE ops, never by removing the gate from dangerous ops."
+  },
+
+  "tiers": {
+
+    "AUTO": {
+      "approval": "none",
+      "comment": "The vast majority of day-to-day work lives here. Runs silently. All actions logged to audit-log.",
+      "allow": [
+        "everything-search (es.exe) and any read-only disk/file inspection",
+        "git status / diff / log / branch --list (read-only git)",
+        "registry validation (project/tool/port/env-policy schema checks)",
+        "read project files, reports, artifacts (non-secret paths)",
+        "context gathering + env-policy redaction + prompt preparation",
+        "delegate analysis/draft/review tasks to Codex (subscription) or local LLM",
+        "Claude review via Bedrock/API — auto WITHIN the monthly budget cap (the cap is the gate)",
+        "generate reports / drafts / artifacts INTO the sandbox/staging output zone",
+        "code edits within a project's own working dir IF git-tracked AND on a non-main branch (fully revertible)",
+        "run a project's own declared safe commands from its adapter allowlist (e.g. tests, build, validators)",
+        "write to ~/.hermes/memories and the brain wiki (knowledge layer)"
+      ],
+      "guardrails": [
+        "auto actions MUST be reversible (git-tracked, or confined to sandbox/staging)",
+        "no writes outside the project working dir or sandbox without a gate",
+        "mutations run dry-run first when a dry-run mode exists"
+      ]
+    },
+
+    "APPROVAL": {
+      "approval": "mobile (Telegram) single-use token, hash-bound to the exact prepared payload",
+      "comment": "Small, deliberate list. These either can't be undone, leave the machine, or touch secrets/money. Kept short so you're rarely interrupted.",
+      "gate": [
+        "delete any file or directory (recursive especially)",
+        "overwrite/modify files OUTSIDE the sandbox or outside a git-tracked working dir",
+        "git reset --hard, force-push, branch delete, merge/PR into main",
+        "send anything off this machine: email, Telegram to OTHER people, social/forum post, PR to a public repo",
+        "any OAuth / login / SSO flow, or reading/using credentials or tokens (job-search credentials.json, google_token.json, etc.)",
+        "install/uninstall packages, system or global-config changes, scheduled-task creation",
+        "browser automation that SUBMITS, sends, purchases, or accepts terms",
+        "stock-research project EXECUTION of any kind (registry risk = HIGH)",
+        "exceeding the monthly API budget cap (default-deny until you raise it)",
+        "expanding who can see/edit a file or resource (sharing/permissions)"
+      ],
+      "behavior": "Hermes prepares + redacts, then STOPS. You get a phone notification showing the exact resolved action; you approve/reject/edit. Execution uses exactly the approved bytes (hash check). One approval = one action; no 'approve once -> 50 auto-sends'."
+    },
+
+    "FORBIDDEN": {
+      "approval": "NONE POSSIBLE — blocked in code even if a human or AI tries to approve it",
+      "comment": "Hardcoded. The orchestrator physically cannot route these. You do them yourself, by hand, outside this system.",
+      "block": [
+        "live broker trades / order placement / position changes (KIS or any broker)",
+        "broker session manipulation or token refresh",
+        "outputting API keys, tokens, passwords, or .env contents anywhere (logs, chat, files, webhooks)",
+        "creating accounts or changing account settings",
+        "rm -rf, mass/bulk deletion, or any irrecoverable history-destroying op",
+        "entering financial/identity data (card, bank, SSN, passport) into any form",
+        "sending the user's secrets/credentials to any external destination"
+      ]
+    }
+  },
+
+  "perDepartmentOverrides": {
+    "ai-tool-research": { "bias": "auto-friendly (LOW). Most research/discovery runs without asking." },
+    "youtube-intelligence": { "bias": "auto-friendly (LOW)." },
+    "digital-nomad": { "bias": "auto for drafts/reports; gate any publish/external-send (MEDIUM)." },
+    "job-search": { "bias": "auto for scoring/collection; GATE anything touching credentials.json / google_token.json / sending applications (MEDIUM, secret-touching)." },
+    "stock-research": { "bias": "auto ONLY for read-only analysis/reports; GATE all execution; broker/trade = FORBIDDEN (HIGH)." }
+  },
+
+  "safetyNets": {
+    "auditLog": "every AUTO and APPROVAL action appended to an append-only audit log (what/when/which agent/which adapter/result). Lets you review automation after the fact.",
+    "apiBudgetCap": "monthly Claude/Bedrock cap from model-policy.json; crossing it = APPROVAL gate, not silent spend.",
+    "reversibilityRequired": "nothing enters AUTO unless it's revertible (git) or sandboxed.",
+    "dryRunDefault": "mutating ops default to dry-run/preview where supported.",
+    "killSwitch": "a single flag (or Telegram command) that drops everything to manual + pauses all adapters.",
+    "approvalIntegrity": "approval tokens are single-use and bound to the payload hash; an approved task cannot be swapped for a different payload before it runs (defends against injected/altered tasks)."
+  },
+
+  "wiring": {
+    "dependsOn": ["env-policy.json", "runtime-policy.json", "model-policy.json", "project-registry.json", "tool-registry.json"],
+    "hermesToolsAllowed": ["status(projectId)", "artifacts(projectId)", "validate(projectId)", "search(query)", "prepare(task)", "risk_review(task)", "delegate(task,worker)", "request_approval(task)", "run_approved(taskId)"],
+    "hermesToolsForbidden": ["raw_shell(cmd)", "raw_env_read()", "raw_api_call()", "raw_browser_control()", "raw_file_write(path)"],
+    "riskReviewModel": "cheap by default (local 8b or Haiku) — it only ADVISES; the human (or, for AUTO tier, the allowlist) decides. Claude/Opus risk-review only for genuinely ambiguous cases."
+  }
+}

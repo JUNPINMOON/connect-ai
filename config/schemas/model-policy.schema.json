@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Connect AI model-policy",
+  "type": "object",
+  "required": ["version", "mutable", "tiers", "guardrails"],
+  "properties": {
+    "version": { "type": "number" },
+    "description": { "type": "string" },
+    "mutable": { "const": false },
+    "defaultBrainTier": { "type": "string" },
+    "tiers": { "type": "object" },
+    "guardrails": {
+      "type": "object",
+      "properties": {
+        "maxConcurrentWorkers": { "type": "number", "minimum": 1 },
+        "approvalForExpensiveRun": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "notes": { "type": "string" }
+  },
+  "additionalProperties": true
+}

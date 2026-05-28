@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "description": "Shared tool registry. Tools are callable infrastructure, not configuration targets.",
+  "tools": [
+    {
+      "id": "ollama",
+      "type": "service",
+      "url": "http://127.0.0.1:11434",
+      "risk": "low",
+      "mutable": false,
+      "notes": "Read/model inference endpoint. Do not change Ollama global configuration from Connect AI."
+    },
+    {
+      "id": "lm-studio",
+      "type": "service",
+      "url": "http://127.0.0.1:1234",
+      "risk": "low",
+      "mutable": false,
+      "notes": "Optional local server. It may be stopped; absence is not a Connect AI failure."
+    },
+    {
+      "id": "aigsd",
+      "type": "project-cli",
+      "projectId": "ai-tool-research",
+      "risk": "low",
+      "mutable": false,
+      "approvalRequiredForRun": true
+    },
+    {
+      "id": "job-search",
+      "type": "project-cli",
+      "projectId": "job-search",
+      "risk": "medium",
+      "mutable": false,
+      "approvalRequiredForRun": true
+    },
+    {
+      "id": "stock-decision-support",
+      "type": "project-cli",
+      "projectId": "stock-research",
+      "risk": "high",
+      "mutable": false,
+      "approvalRequiredForRun": true
+    },
+    {
+      "id": "everything-search",
+      "type": "service",
+      "transport": "cli",
+      "binary": "C:\\Users\\mjb58\\Scripts\\es.exe",
+      "wrapper": "tools\\es-search.ps1",
+      "backend": "Everything IPC",
+      "risk": "low",
+      "mutable": false,
+      "approvalRequiredForRun": false,
+      "role": "Read-only full-disk filename search for local agents. Use full paths; no PATH/global changes."
+    },
+    {
+      "id": "gate-check",
+      "description": "정책 게이트 CLI — Hermes/n8n이 node scripts/gate-check.js로 호출",
+      "path": "scripts/gate-check.js",
+      "runtime": "node",
+      "mutable": false
+    },
+    {
+      "id": "memory-cli",
+      "description": "메모리 브리지 CLI — list/read/write-decision",
+      "path": "scripts/memory-cli.js",
+      "runtime": "node",
+      "mutable": false
+    },
+    {
+      "id": "youtube_ingest",
+      "description": "YouTube URL 분석 — 자막 있으면 트랜스크립트, 없으면 화면분석 요청 inbox 생성",
+      "path": "scripts/youtube-ingest.js",
+      "runtime": "node",
+      "mutable": false
+    }
+  ]
+}

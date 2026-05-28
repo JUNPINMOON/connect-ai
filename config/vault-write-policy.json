@@ -1,0 +1,64 @@
+{
+  "schema": "connect-ai.vault-write-policy.v1",
+  "allowedSubdirs": [
+    "00_MOC/",
+    "decisions/",
+    "runbooks/",
+    "inbox/",
+    "wiki/",
+    "agent-guides/",
+    "codex-memory/",
+    "youtube/",
+    "notes/",
+    "ideas/",
+    "references/"
+  ],
+  "forbiddenFilenamePatterns": [
+    {
+      "id": "daily-working-log",
+      "pattern": "(^|/)agent-os-.*\\.md$",
+      "suggestion": "git commit/PARTIAL report를 사용하고, 핀이 읽을 가치가 있는 장기 노트만 wiki/ 또는 00_MOC/에 작성하세요."
+    },
+    {
+      "id": "date-prefix-note",
+      "pattern": "(^|/)\\d{4}-\\d{2}-\\d{2}[-_ ].*\\.md$",
+      "suggestion": "날짜 prefix 대신 notes/<topic>.md, ideas/<topic>.md, references/<topic>.md 중 하나를 사용하세요."
+    }
+  ],
+  "frontmatterRequired": [
+    "type",
+    "status",
+    "tags",
+    "related"
+  ],
+  "routineNoteTypes": [
+    "evidence"
+  ],
+  "routineAllowedPrefixes": [
+    "notes/",
+    "ideas/",
+    "references/"
+  ],
+  "protectedDurableTypes": [
+    "moc",
+    "project",
+    "runbook",
+    "decision",
+    "agent",
+    "tool"
+  ],
+  "mocHubLinks": [
+    "[[00_MOC/AI Agent OS]]",
+    "[[00_MOC/Projects]]",
+    "[[00_MOC/Tools]]",
+    "[[00_MOC/Agents]]",
+    "[[00_MOC/Decisions]]",
+    "[[00_MOC/Runbooks]]",
+    "[[00_MOC/moc-agents]]",
+    "[[00_MOC/moc-projects]]",
+    "[[00_MOC/moc-infrastructure]]",
+    "[[00_MOC/moc-runbooks]]",
+    "[[00_MOC/moc-learning]]"
+  ],
+  "singleWriter": "scripts/vault-writer.js"
+}

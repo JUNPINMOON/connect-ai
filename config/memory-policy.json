@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "description": "Memory vault policy for Connect AI. The vault is an external Obsidian-readable markdown store; it is referenced by absolute path and must never be bundled into the VSIX.",
+  "mutable": false,
+  "memoryRoot": "C:\\Users\\mjb58\\connect-ai-vault",
+  "allowedSubdirs": ["", "00_MOC/", "decisions/", "runbooks/", "inbox/", "wiki/", "agent-guides/", "codex-memory/", "youtube/", "notes/", "ideas/", "references/"],
+  "forbiddenWrite": ["repo-internal", ".obsidian/", "outside-vault", "secrets"],
+  "writeMode": "live",
+  "liveSubdirs": ["decisions/", "references/"],
+  "observeSubdirs": ["runbooks/", "inbox/"],
+  "redact": true
+}

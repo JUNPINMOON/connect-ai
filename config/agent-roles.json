@@ -1,0 +1,119 @@
+{
+  "version": "1.0",
+  "updated": "2026-05-28",
+  "enforcement": "partial-mcp-gated",
+  "policySource": "runbooks/hermes-cost-policy.md",
+  "notes": "Role metadata is displayed in the UI. Local tool paths are partially enforced for exact-name matches, and sensitive MCP tools are gated in mcp/server.js. Keep enforcement partial until approval queue execution is wired.",
+  "agents": {
+    "ceo": {
+      "executor": "hermes",
+      "status": "active",
+      "primaryNotes": ["wiki/projects/Connect AI.md", "wiki/tools/정책 게이트.md"],
+      "allowedTools": ["memory_list", "memory_read", "gate_check", "audit_recent", "everything_search", "task_list", "task_enqueue", "task_dispatch_goal", "task_dispatch_verification", "task_apply_verification", "task_update_status", "task_claim"],
+      "approvalTools": ["memory_write_decision"],
+      "forbiddenTools": ["lilys_ingest_youtube_url", "youtube_ingest"],
+      "riskLevel": "medium",
+      "nextAction": "운영 정책과 비용 기준을 기준으로 작업 분배를 승인한다.",
+      "uiBadges": ["orchestrator", "policy"]
+    },
+    "youtube": {
+      "executor": "hermes->codex",
+      "status": "active",
+      "primaryNotes": ["wiki/projects/유튜브.md", "youtube/runbook-lilys-login-automation.md"],
+      "allowedTools": ["memory_list", "memory_read", "gate_check", "everything_search", "lilys_session_check"],
+      "approvalTools": ["lilys_ingest_youtube_url", "youtube_ingest", "memory_write_decision"],
+      "forbiddenTools": [],
+      "riskLevel": "high",
+      "nextAction": "Lilys/yt-dlp ingest 결과를 운영 노트와 콘텐츠 파이프라인에 연결한다.",
+      "uiBadges": ["youtube", "external-call", "cost-source"]
+    },
+    "instagram": {
+      "executor": "none",
+      "status": "not_connected",
+      "primaryNotes": [],
+      "allowedTools": ["memory_list", "memory_read"],
+      "approvalTools": [],
+      "forbiddenTools": ["memory_write_decision", "lilys_ingest_youtube_url", "youtube_ingest"],
+      "riskLevel": "low",
+      "nextAction": "담당 노트와 실행 주체를 연결한 뒤 활성화한다.",
+      "uiBadges": ["not-connected", "persona"]
+    },
+    "designer": {
+      "executor": "none",
+      "status": "not_connected",
+      "primaryNotes": [],
+      "allowedTools": ["memory_list", "memory_read"],
+      "approvalTools": [],
+      "forbiddenTools": ["memory_write_decision", "lilys_ingest_youtube_url", "youtube_ingest"],
+      "riskLevel": "low",
+      "nextAction": "브랜드/썸네일 담당 노트를 만든 뒤 실행 주체를 연결한다.",
+      "uiBadges": ["not-connected", "persona"]
+    },
+    "developer": {
+      "executor": "codex",
+      "status": "active",
+      "primaryNotes": ["wiki/tools/Codex.md", "runbooks/hermes-cost-policy.md"],
+      "allowedTools": ["memory_list", "memory_read", "gate_check", "audit_recent", "everything_search", "task_dispatch_goal"],
+      "approvalTools": ["memory_write_decision"],
+      "forbiddenTools": ["lilys_ingest_youtube_url", "youtube_ingest"],
+      "riskLevel": "medium",
+      "nextAction": "로컬 코드 변경과 검증을 담당하되 외부 호출은 Hermes 승인 경로로 넘긴다.",
+      "uiBadges": ["real-executor", "local-implementation"]
+    },
+    "business": {
+      "executor": "none",
+      "status": "not_connected",
+      "primaryNotes": [],
+      "allowedTools": ["memory_list", "memory_read"],
+      "approvalTools": [],
+      "forbiddenTools": ["memory_write_decision", "lilys_ingest_youtube_url", "youtube_ingest"],
+      "riskLevel": "low",
+      "nextAction": "수익화/가격 전략 담당 노트를 만든 뒤 실행 주체를 연결한다.",
+      "uiBadges": ["not-connected", "strategy"]
+    },
+    "secretary": {
+      "executor": "hermes",
+      "status": "optional",
+      "primaryNotes": [],
+      "allowedTools": ["memory_list", "memory_read", "gate_check", "audit_recent", "task_list", "task_dispatch_goal", "task_dispatch_verification", "task_apply_verification", "task_update_status", "task_claim"],
+      "approvalTools": ["memory_write_decision"],
+      "forbiddenTools": ["lilys_ingest_youtube_url", "youtube_ingest"],
+      "riskLevel": "medium",
+      "nextAction": "작업 요약과 알림 브릿지를 운영 기준에 맞춰 정리한다.",
+      "uiBadges": ["operations", "reporting"]
+    },
+    "editor": {
+      "executor": "none",
+      "status": "hiring_wait",
+      "primaryNotes": ["wiki/tools/로컬 LLM.md"],
+      "allowedTools": ["memory_list", "memory_read"],
+      "approvalTools": [],
+      "forbiddenTools": ["memory_write_decision", "lilys_ingest_youtube_url", "youtube_ingest"],
+      "riskLevel": "low",
+      "nextAction": "음악/편집 담당 노트를 만든 뒤 로컬 도구 상태를 검증한다.",
+      "uiBadges": ["not-connected", "media"]
+    },
+    "writer": {
+      "executor": "claude->codex",
+      "status": "optional",
+      "primaryNotes": ["wiki/tools/작업 파이프라인.md", "wiki/projects/유튜브.md"],
+      "allowedTools": ["memory_list", "memory_read", "gate_check", "everything_search"],
+      "approvalTools": ["memory_write_decision"],
+      "forbiddenTools": ["lilys_ingest_youtube_url", "youtube_ingest"],
+      "riskLevel": "low",
+      "nextAction": "YouTube ingest 결과를 스크립트/카피 초안으로 변환한다.",
+      "uiBadges": ["content", "read-mostly"]
+    },
+    "researcher": {
+      "executor": "claude->codex",
+      "status": "active",
+      "primaryNotes": ["wiki/projects/AI도구 리서치.md", "wiki/tools/Everything 검색.md"],
+      "allowedTools": ["memory_list", "memory_read", "gate_check", "everything_search"],
+      "approvalTools": ["memory_write_decision"],
+      "forbiddenTools": ["lilys_ingest_youtube_url", "youtube_ingest"],
+      "riskLevel": "low",
+      "nextAction": "Everything 검색과 vault 근거를 연결해 리서치 결과를 검증한다.",
+      "uiBadges": ["research", "evidence"]
+    }
+  }
+}

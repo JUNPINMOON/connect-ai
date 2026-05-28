@@ -5,6 +5,57 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { spawn, spawnSync } from 'child_process';
+import { registerOurDepartmentCommands } from './our/hooks';
+import { createEnvPolicyRedactor } from './our/env-policy';
+import { createDurableNote, type DurableNoteMeta } from './our/memory-bridge';
+
+// === 시간대 헬퍼 (KST 고정) ===
+// 기존 코드가 new Date().toISOString().slice(0,10)으로 UTC 날짜를 뽑아,
+// KST 00:00~09:00 구간에 날짜가 하루 어긋나는 버그가 있었다. 항상 Asia/Seoul
+// 기준 YYYY-MM-DD를 반환하도록 통일한다.
+const APP_TZ = 'Asia/Seoul';
+function kstDate(d: Date = new Date()): string {
+    return d.toLocaleDateString('en-CA', { timeZone: APP_TZ }); // YYYY-MM-DD
+}
+function kstDateDaysAgo(days: number): string {
+    return kstDate(new Date(Date.now() - days * 86400000));
+}
+
+let debugChannel: vscode.OutputChannel | undefined;
+let envPolicyRedactor: ((value: unknown) => string) | undefined;
+const DEBUG_REDACTION_PATTERNS: RegExp[] = [
+    /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g,
+    /\b(?:AIza|ya29\.|xox[baprs]-|gh[pousr]_|sk-|sk_live_|sk_test_)[A-Za-z0-9._-]{12,}\b/g,
+    /\b(?:token|secret|password|passwd|api[_-]?key|client[_-]?secret|authorization|cookie)\b\s*[:=]\s*["']?[^"'\s,}]+/gi,
+    /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi,
+];
+
+function redactForDebug(value: unknown): string {
+    let text = typeof value === 'string' ? value : String(value);
+    if (text.length > 500) text = text.slice(0, 500) + '...<truncated>';
+    for (const pattern of DEBUG_REDACTION_PATTERNS) {
+        text = text.replace(pattern, (match) => {
+            const keyMatch = match.match(/^([^:=]+[:=]\s*)/);
+            return keyMatch ? `${keyMatch[1]}<redacted>` : '<redacted>';
+        });
+    }
+    if (envPolicyRedactor) text = envPolicyRedactor(text);
+    return text;
+}
+
+function logDebug(message: string) {
+    if (!debugChannel) {
+        debugChannel = vscode.window.createOutputChannel("Connect AI Debug");
+    }
+    const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    debugChannel.appendLine(`[${ts}] ${redactForDebug(message)}`);
+}
+
+function logWebviewMessage(source: string, msg: any) {
+    const type = typeof msg?.type === 'string' ? msg.type : typeof msg;
+    const keys = msg && typeof msg === 'object' ? Object.keys(msg).filter(k => k !== 'token' && k !== 'secret' && k !== 'password').slice(0, 12).join(',') : '';
+    logDebug(`[${source}] type=${type}${keys ? ` keys=${keys}` : ''}`);
+}
 
 // ============================================================
 // Security helpers
@@ -592,6 +643,108 @@ function _pythonMissingHint(): string {
            (process.platform === 'win32' ? '  - PowerShell: \`Get-Command python, python3, py\`' : '  - 터미널: \`which python3 python py\`');
 }
 
+function _windowsUserForVaultPolicy(): string {
+    try { return process.env.USERNAME || process.env.USER || os.userInfo().username || ''; }
+    catch { return process.env.USERNAME || process.env.USER || ''; }
+}
+
+function normalizeVaultPolicyPathish(value: string): string {
+    return String(value || '').toLowerCase().replace(/\\/g, '/').replace(/["']/g, '').replace(/\/+$/g, '');
+}
+
+function vaultPolicyRoots(): string[] {
+    const roots = new Set<string>([
+        path.join(os.homedir(), 'connect-ai-vault'),
+    ]);
+    const user = _windowsUserForVaultPolicy();
+    if (user) roots.add(`/mnt/c/users/${user}/connect-ai-vault`);
+    try { roots.add(_getBrainDir()); } catch { /* extension config may be unavailable in tests */ }
+    return Array.from(roots)
+        .map(normalizeVaultPolicyPathish)
+        .filter(Boolean);
+}
+
+function commandMentionsVaultRoot(command: string): boolean {
+    const folded = normalizeVaultPolicyPathish(command);
+    const candidates = new Set<string>([
+        'connect-ai-vault',
+        ...vaultPolicyRoots(),
+    ]);
+    for (const candidate of candidates) {
+        const needle = normalizeVaultPolicyPathish(candidate);
+        if (needle && folded.includes(needle)) return true;
+    }
+    return false;
+}
+
+function commandRunsInsideVaultRoot(cwd: string = ''): boolean {
+    const folded = normalizeVaultPolicyPathish(cwd);
+    if (!folded) return false;
+    for (const root of vaultPolicyRoots()) {
+        if (folded === root || folded.startsWith(root + '/')) return true;
+    }
+    return /(^|\/)connect-ai-vault(?:\/|$)/i.test(folded);
+}
+
+function commandAttemptsDirectVaultMutation(normalized: string, cwd: string = ''): boolean {
+    // Read-only vault references are allowed; only mutation-shaped commands are blocked here.
+    // vault cwd relative mutations are blocked even when the command omits an absolute vault path.
+    if (!commandMentionsVaultRoot(normalized) && !commandRunsInsideVaultRoot(cwd)) return false;
+    const mutatingPatterns: RegExp[] = [
+        /\b(?:set-content|add-content|out-file|new-item|copy-item|move-item|remove-item|clear-content|rename-item)\b/i,
+        /\b(?:sc|ac|ni|cp|copy|mv|move|rm|ri|del|erase|mkdir|md|rmdir|rd|ren|rename)\b/i,
+        /\b(?:tee)\b/i,
+        /\bfs\.(?:writeFileSync|writeFile|appendFileSync|appendFile|rmSync|unlinkSync|mkdirSync|renameSync|copyFileSync)\b/i,
+        /\b(?:write_text|write_bytes|unlink|rmdir|mkdir|rename|replace)\s*\(/i,
+        /\bopen\s*\([^)]*['"][waax]\+?['"]/i,
+        /\bgit\s+(?:-C\s+["']?[^&|;]*connect-ai-vault[^&|;]*\s+)?(?:add|commit|rm|mv|reset|checkout|clean)\b/i,
+    ];
+    if (/(^|[^<])>>?/.test(normalized)) return true;
+    return mutatingPatterns.some(pattern => pattern.test(normalized));
+}
+
+function validateCommandSafety(cmd: string, cwd: string = ''): { safe: boolean; reason?: string } {
+    const normalized = cmd.replace(/[`^]/g, '').replace(/\s+/g, ' ').trim();
+    if (commandAttemptsDirectVaultMutation(normalized, cwd)) {
+        return {
+            safe: false,
+            reason: 'direct Obsidian vault writes are forbidden for run_command; use brain-inject/memory-bridge or vault-writer for durable notes, and companyDir for runtime output'
+        };
+    }
+    const dangerousPatterns: Array<{ pattern: RegExp; reason: string }> = [
+        { pattern: /\brm\s+-[a-z]*r[a-z]*f\b/i, reason: 'recursive force delete' },
+        { pattern: /\brm\s+-[a-z]*f[a-z]*r\b/i, reason: 'recursive force delete' },
+        { pattern: /\b(?:rd|rmdir)\b(?=.*\/s\b)/i, reason: 'recursive directory delete' },
+        { pattern: /\bdel\s+.*\/s\b/i, reason: 'recursive file delete' },
+        { pattern: /\bremove-item\b(?=.*\b(?:-r|-recurse)\b)(?=.*\b(?:-fo|-force)\b)/i, reason: 'PowerShell recursive force delete' },
+        { pattern: /\b(?:rm|ri|erase)\b(?=.*\b(?:-r|-recurse)\b)(?=.*\b(?:-fo|-force)\b)/i, reason: 'PowerShell recursive force delete alias' },
+        { pattern: /\bformat\b/i, reason: 'drive format' },
+        { pattern: /\bmkfs(?:\.[a-z0-9]+)?\b/i, reason: 'filesystem creation' },
+        { pattern: /\bdd\s+if=/i, reason: 'raw disk write/copy' },
+        { pattern: /\bdiskpart\b/i, reason: 'disk partitioning' },
+        { pattern: /\bbcdedit\b/i, reason: 'boot configuration change' },
+        { pattern: /\bshutdown\b/i, reason: 'system shutdown' },
+        { pattern: /\breboot\b/i, reason: 'system reboot' },
+        { pattern: /\brestart-computer\b/i, reason: 'system reboot' },
+        { pattern: /\bstop-computer\b/i, reason: 'system shutdown' },
+        { pattern: /\binit\s+[06]\b/i, reason: 'system power state change' },
+        { pattern: /\bnet\s+user\s+.*\s+\/add\b/i, reason: 'local user creation' },
+        { pattern: /\bnet\s+localgroup\s+administrators\b/i, reason: 'administrator group change' },
+        { pattern: /\bnetsh\s+advfirewall\b/i, reason: 'firewall policy change' },
+        { pattern: /\bset-executionpolicy\b/i, reason: 'PowerShell execution policy change' },
+        { pattern: /\b(?:powershell|pwsh)(?:\.exe)?\b.*\b(?:-enc|-encodedcommand)\b/i, reason: 'encoded PowerShell command' },
+        { pattern: /\binvoke-expression\b|\biex\b/i, reason: 'dynamic PowerShell execution' },
+        { pattern: /\b(?:curl|iwr|irm|wget)\b.*\|\s*(?:powershell|pwsh|sh|bash|iex|invoke-expression)\b/i, reason: 'download-and-execute pipeline' },
+        { pattern: /\bgit\s+push\b.*\b(?:--force|-f)\b/i, reason: 'force push' },
+    ];
+    for (const { pattern, reason } of dangerousPatterns) {
+        if (pattern.test(normalized)) {
+            return { safe: false, reason: `위험한 명령어가 감지되었습니다: ${reason}` };
+        }
+    }
+    return { safe: true };
+}
+
 /**
  * Run a shell command and capture stdout+stderr live so the AI can act on the result.
  * - Streams output to onChunk for live display in the chat
@@ -606,6 +759,15 @@ function runCommandCaptured(
     timeoutMs = 60000,
     captureStream: 'both' | 'stdout' = 'both'
 ): Promise<{ exitCode: number; output: string; timedOut: boolean }> {
+    const safety = validateCommandSafety(cmd, cwd);
+    if (!safety.safe) {
+        vscode.window.showWarningMessage(`⚠️ Connect AI 차단됨: ${safety.reason}`);
+        return Promise.resolve({
+            exitCode: -99,
+            output: `[차단됨] ${safety.reason}`,
+            timedOut: false
+        });
+    }
     return new Promise((resolve) => {
         const child = spawn(cmd, {
             cwd,
@@ -668,6 +830,9 @@ function getConfig() {
     // 자동 선택. 디폴트 'gemma4:e2b' 같은 큰 모델을 강제해서 저사양 PC가
     // 첫 호출에서 실패하던 문제 방지.
     const defaultModel = (cfg.get<string>('defaultModel', '') || '').trim();
+    const plannerProviderRaw = (cfg.get<string>('plannerProvider', 'antigravity') || '').trim().toLowerCase();
+    const plannerProvider = plannerProviderRaw === 'local' ? 'local' : 'antigravity';
+    const localLlmEnabled = cfg.get<boolean>('localLlmEnabled', false) === true;
 
     // requestTimeout: clamp to [5, 1800] seconds, then convert to ms.
     const rawTimeout = cfg.get<number>('requestTimeout', 300);
@@ -678,6 +843,8 @@ function getConfig() {
     return {
         ollamaBase,
         defaultModel,
+        plannerProvider,
+        localLlmEnabled,
         maxTreeFiles: 200,
         timeout: timeoutSec * 1000,
         localBrainPath: cfg.get<string>('localBrainPath', '') || ''
@@ -899,13 +1066,10 @@ function buildWorldDeskPositions(): Record<string, DeskPos> {
 }
 
 // Two layouts supported:
-//   1) Nested (default, v2.58): company at `<brain>/_company/`. Same git
-//      repo, brain stays clean at root, _company/ collapses under one
-//      prefix. Best for solo users who want one backup.
-//   2) Detached (v2.59): user sets `connectAiLab.companyDir` to an absolute
-//      path. Company lives wherever they want — e.g., team-shared folder,
-//      separate git repo, different cloud sync. Brain stays at brain root,
-//      independent.
+//   1) Runtime default (Agent OS): company at `~/connect-ai-runtime/company`.
+//      Runtime output stays outside the Obsidian graph by default.
+//   2) Explicit path: user sets `connectAiLab.companyDir` to an absolute path,
+//      including `<brain>/_company/` only when they intentionally choose nested.
 /* COMPANY_SUBDIR, _resolvePathInput, getCompanyDir 모두 ./paths.ts 로 이동.
    여기엔 COMPANY_SUBDIR과 무관한 INTERNAL_DIRS 만 남김. */
 const COMPANY_INTERNAL_DIRS = new Set(['_cache', '_tmp']);
@@ -939,14 +1103,12 @@ function _migrateCompanyToSubdir() {
 }
 
 async function setCompanyDir(absPath: string) {
-  // Redirects to localBrainPath: choosing a company location now means
-  // choosing where the brain (and therefore the company) lives.
   try {
     const cfg = vscode.workspace.getConfiguration('connectAiLab');
-    await cfg.update('localBrainPath', absPath, vscode.ConfigurationTarget.Global);
+    await cfg.update('companyDir', absPath, vscode.ConfigurationTarget.Global);
   } catch {
     if (_extCtx) {
-      try { await _extCtx.globalState.update('localBrainPath', absPath); } catch {}
+      try { await _extCtx.globalState.update('companyDir', absPath); } catch {}
     }
   }
 }
@@ -1009,11 +1171,17 @@ function _migrateCompanyToBrain() {
 
     const cfg = vscode.workspace.getConfiguration('connectAiLab');
     let legacy = ((cfg.get('companyDir') as string | undefined) || '').trim();
+    const configuredCompanyDir = legacy;
     if (!legacy && _extCtx) {
       legacy = (_extCtx.globalState.get<string>('companyDir') || '').trim();
     }
     if (legacy.startsWith('~/')) legacy = path.join(os.homedir(), legacy.slice(2));
     if (!legacy) legacy = path.join(brain, 'Company');
+    const resolvedLegacy = _resolvePathInput(legacy);
+    const resolvedBrain = path.resolve(brain);
+    if (configuredCompanyDir && resolvedLegacy && !path.normalize(resolvedLegacy).startsWith(path.normalize(resolvedBrain) + path.sep)) {
+      return; // detached companyDir is intentional runtime state, not legacy brain material
+    }
 
     if (!fs.existsSync(path.join(legacy, '_shared'))) return; // nothing to migrate
 
@@ -1056,11 +1224,11 @@ function getCompanyDay(): number {
         const m = getCompanyMetrics();
         let founded = m.foundedAt;
         if (!founded) {
-            founded = new Date().toISOString().slice(0, 10);
+            founded = kstDate();
             updateCompanyMetrics({ foundedAt: founded });
         }
         const start = Date.parse(founded + 'T00:00:00');
-        const now = Date.parse(new Date().toISOString().slice(0, 10) + 'T00:00:00');
+        const now = Date.parse(kstDate() + 'T00:00:00');
         if (!isFinite(start) || !isFinite(now)) return 1;
         return Math.max(1, Math.floor((now - start) / 86400000) + 1);
     } catch { return 1; }
@@ -1080,6 +1248,90 @@ function updateCompanyMetrics(updates: any) {
     } catch (e: any) {
         console.warn('[updateCompanyMetrics] write failed:', e?.message || e);
     }
+}
+
+function _memoryBridgeExtensionRoot(): string {
+    return _extCtx?.extensionUri?.fsPath || path.resolve(__dirname, '..');
+}
+
+function _memoryBridgeStorageRoot(): string {
+    return _extCtx?.globalStorageUri?.fsPath || path.dirname(path.dirname(_agentQueuePath()));
+}
+
+function buildBrainInjectNoteRequest(safeTitle: string, markdown: string): DurableNoteMeta {
+    const hubLinks = ["[[00_MOC/AI Agent OS]]", "[[00_MOC/Runbooks]]"];
+    const body = [
+        `# ${safeTitle}`,
+        "",
+        String(markdown || "").trim(),
+        "",
+        "## 연관 허브",
+        ...hubLinks.map((link) => `- ${link}`),
+        "",
+    ].join("\n");
+    return {
+        relPath: `references/brain-injects/${safeTitle}.md`,
+        title: safeTitle,
+        type: "evidence",
+        status: "draft",
+        project: "Connect AI",
+        owner: "brain-inject",
+        source: "connect-ai-bridge",
+        tags: ["brain-inject", "agent-os", "evidence"],
+        related: hubLinks,
+        links: hubLinks,
+        body,
+    };
+}
+
+function buildLocalBrainAttachmentNoteRequest(safeTitle: string, fileContent: string): DurableNoteMeta {
+    const title = safeTitle.replace(/\.md$/i, "") || "local-brain-attachment";
+    const hubLinks = ["[[00_MOC/AI Agent OS]]", "[[00_MOC/Runbooks]]"];
+    const body = [
+        `# ${title}`,
+        "",
+        "## 원본 파일",
+        `- 파일명: ${safeTitle}`,
+        "- 출처: Connect AI sidebar local brain injection",
+        "",
+        "## 원문",
+        "```text",
+        String(fileContent || "").trim(),
+        "```",
+        "",
+        "## 연관 허브",
+        ...hubLinks.map((link) => `- ${link}`),
+        "",
+    ].join("\n");
+    return {
+        relPath: `references/brain-injects/${title}.md`,
+        title,
+        type: "evidence",
+        status: "draft",
+        project: "Connect AI",
+        owner: "sidebar-brain-inject",
+        source: "connect-ai-sidebar",
+        tags: ["brain-inject", "sidebar", "agent-os", "evidence"],
+        related: hubLinks,
+        links: hubLinks,
+        body,
+    };
+}
+
+function writeBrainInjectNote(safeTitle: string, markdown: string) {
+    return createDurableNote(
+        _memoryBridgeExtensionRoot(),
+        _memoryBridgeStorageRoot(),
+        buildBrainInjectNoteRequest(safeTitle, markdown)
+    );
+}
+
+function writeLocalBrainAttachmentNote(safeTitle: string, fileContent: string) {
+    return createDurableNote(
+        _memoryBridgeExtensionRoot(),
+        _memoryBridgeStorageRoot(),
+        buildLocalBrainAttachmentNoteRequest(safeTitle, fileContent)
+    );
 }
 
 function _extractCompanyName(idMd: string): string {
@@ -2003,6 +2255,7 @@ function readToolAutonomyLevel(agentId: string): number {
 
 async function _quickLLMCall(systemPrompt: string, userMsg: string, maxTokens = 64): Promise<string> {
     const { ollamaBase, defaultModel, timeout } = getConfig();
+    logDebug(`[LLM Call] model=${defaultModel || '(auto)'}, url=${ollamaBase}, userChars=${userMsg.length}, systemChars=${systemPrompt.length}, maxTokens=${maxTokens}`);
     const isLMStudio = _isLMStudioEngine(ollamaBase);
     const apiUrl = isLMStudio ? `${ollamaBase}/v1/chat/completions` : `${ollamaBase}/api/chat`;
     const messages = [
@@ -2010,24 +2263,191 @@ async function _quickLLMCall(systemPrompt: string, userMsg: string, maxTokens = 
         { role: 'user', content: userMsg }
     ];
     const tmo = Math.min(timeout || 60000, 60000);
-    if (isLMStudio) {
-        const body = { model: defaultModel, messages, stream: false, max_tokens: maxTokens, temperature: 0.2 };
+    try {
+        if (isLMStudio) {
+            const body = { model: defaultModel, messages, stream: false, max_tokens: maxTokens, temperature: 0.2 };
+            const r = await axios.post(apiUrl, body, { timeout: tmo });
+            const resp = r.data?.choices?.[0]?.message?.content?.toString().trim() || '';
+            logDebug(`[LLM Response] chars=${resp.length}`);
+            return resp;
+        }
+        const body = { model: defaultModel, messages, stream: false, options: { num_predict: maxTokens, temperature: 0.2 } };
         const r = await axios.post(apiUrl, body, { timeout: tmo });
-        return r.data?.choices?.[0]?.message?.content?.toString().trim() || '';
+        const resp = r.data?.message?.content?.toString().trim() || '';
+        logDebug(`[LLM Response] chars=${resp.length}`);
+        return resp;
+    } catch (e: any) {
+        logDebug(`[LLM Error] _quickLLMCall failed: ${e?.message || e}`);
+        vscode.window.showErrorMessage(`⚠️ Connect AI LLM 연결 실패: 로컬 LLM 서버(Ollama/LM Studio)가 실행 중인지 확인해 주세요. (주소: ${ollamaBase})`);
+        throw e;
     }
-    const body = { model: defaultModel, messages, stream: false, options: { num_predict: maxTokens, temperature: 0.2 } };
-    const r = await axios.post(apiUrl, body, { timeout: tmo });
-    return r.data?.message?.content?.toString().trim() || '';
+}
+
+function _antigravityBinPath(): string {
+    if (process.env.AGY_BIN && process.env.AGY_BIN.trim()) return process.env.AGY_BIN.trim();
+    if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
+        return path.join(process.env.LOCALAPPDATA, 'agy', 'bin', 'agy.exe');
+    }
+    return 'agy';
+}
+
+function _newestAntigravityTranscriptFiles(limit = 8): { filePath: string; mtimeMs: number }[] {
+    const roots = [
+        path.join(os.homedir(), '.gemini', 'antigravity-cli', 'brain'),
+        path.join(os.homedir(), '.gemini', 'antigravity', 'brain'),
+    ];
+    const found: { filePath: string; mtimeMs: number }[] = [];
+    const walk = (dir: string) => {
+        let entries: fs.Dirent[] = [];
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                walk(fullPath);
+            } else if (entry.isFile() && entry.name === 'transcript.jsonl') {
+                try { found.push({ filePath: fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs }); } catch { /* ignore */ }
+            }
+        }
+    };
+    for (const root of roots) walk(root);
+    return found.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, limit);
+}
+
+function _extractAntigravityTranscriptResponse(filePath: string): string {
+    let lines: string[] = [];
+    try { lines = fs.readFileSync(filePath, 'utf-8').split(/\r?\n/).filter(Boolean); } catch { return ''; }
+    const responses: string[] = [];
+    for (const line of lines) {
+        try {
+            const event = JSON.parse(line);
+            if (event?.source === 'MODEL' && typeof event.content === 'string' && event.content.trim()) {
+                responses.push(event.content.trim());
+            }
+        } catch { /* append-only jsonl can have partial lines */ }
+    }
+    for (let i = responses.length - 1; i >= 0; i--) {
+        const response = responses[i];
+        if (response.length >= 80 || /"tasks"\s*:|"agent"\s*:|"brief"\s*:|```/.test(response)) {
+            return response;
+        }
+    }
+    return responses.at(-1) || '';
+}
+
+function _extractLatestAntigravityResponse(sinceMs: number): { response: string; transcript: string } {
+    for (const item of _newestAntigravityTranscriptFiles()) {
+        if (sinceMs && item.mtimeMs + 2000 < sinceMs) continue;
+        const response = _extractAntigravityTranscriptResponse(item.filePath);
+        if (response) return { response, transcript: item.filePath };
+    }
+    return { response: '', transcript: '' };
+}
+
+function _stripCliNoise(text: string): string {
+    return String(text || '')
+        .split(/\r?\n/)
+        .filter(line => !/^Warning:/i.test(line.trim()))
+        .filter(line => !/^Ripgrep is not available/i.test(line.trim()))
+        .join('\n')
+        .trim();
+}
+
+function _geminiCliInvocation(): { cmd: string; argsPrefix: string[]; shell: boolean } {
+    if (process.platform === 'win32' && process.env.APPDATA) {
+        const bundle = path.join(process.env.APPDATA, 'npm', 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js');
+        if (fs.existsSync(bundle)) return { cmd: process.execPath, argsPrefix: [bundle], shell: false };
+    }
+    return { cmd: 'gemini', argsPrefix: [], shell: process.platform === 'win32' };
+}
+
+function _callGeminiCliFallback(prompt: string, env: NodeJS.ProcessEnv, opts?: { label?: string }): string {
+    logDebug(`[CLI LLM] provider=gemini-fallback label=${opts?.label || 'generic'} promptChars=${prompt.length}`);
+    const invocation = _geminiCliInvocation();
+    const result = spawnSync(invocation.cmd, [...invocation.argsPrefix, '--skip-trust', '--approval-mode', 'plan', '--output-format', 'text', '--prompt', 'Read stdin and answer the request.'], {
+        cwd: _getBrainDir(),
+        env,
+        encoding: 'utf-8',
+        maxBuffer: 20 * 1024 * 1024,
+        windowsHide: true,
+        shell: invocation.shell,
+        timeout: 150000,
+        input: prompt,
+    });
+    const response = _stripCliNoise(String(result.stdout || ''));
+    if (!response || _looksLikeCliFailureResponse(response)) {
+        const err = String(result.stderr || result.error?.message || '').trim();
+        const output = response ? ` stdout=${response.slice(0, 500)}` : '';
+        throw new Error(`Gemini CLI fallback failed exit=${result.status ?? 1}${err ? `: ${err.slice(0, 500)}` : ''}${output}`);
+    }
+    return response;
+}
+
+function _looksLikeCliFailureResponse(response: string): boolean {
+    const text = String(response || '').trim();
+    if (!text) return true;
+    return /RESOURCE_EXHAUSTED|quota|rate limit|429|authentication|auth expired|failed to sign in|consent could not be obtained|cli failed|failed exit=\d+|all agents.*failed|모든 에이전트.*실패|CEO 호출 실패|error:/i.test(text);
+}
+
+function _looksLikeJsonObjectResponse(response: string): boolean {
+    const text = String(response || '').replace(/```[a-zA-Z]*\n?|```/g, '').trim();
+    if (!text.includes('{') || !text.includes('}')) return false;
+    return _extractJsonObjects(text).some(obj => obj && (Array.isArray(obj.tasks) || typeof obj.brief === 'string' || typeof obj.mode === 'string'));
+}
+
+async function _callAntigravityCli(systemPrompt: string, userMsg: string, opts?: { jsonMode?: boolean; label?: string }): Promise<string> {
+    const agy = _antigravityBinPath();
+    const prompt = [
+        systemPrompt,
+        '',
+        `[Connect AI ${opts?.label || 'CLI LLM'}]`,
+        opts?.jsonMode ? '- Return exactly one JSON object.' : '- Return a concise, useful answer.',
+        opts?.jsonMode ? '- Do not use markdown fences.' : '- Do not claim tool/file execution unless the provided context says it happened.',
+        '- Do not edit files or run commands.',
+        '- This is reasoning/planning/text response only.',
+        '',
+        userMsg,
+    ].join('\n');
+    const env = { ...process.env };
+    delete env.GEMINI_API_KEY;
+    const started = Date.now();
+    logDebug(`[CLI LLM] provider=antigravity label=${opts?.label || 'generic'} bin=${agy} promptChars=${prompt.length}`);
+    const result = spawnSync(agy, ['--print', prompt, '--print-timeout', '2m'], {
+        cwd: _getBrainDir(),
+        env,
+        encoding: 'utf-8',
+        maxBuffer: 20 * 1024 * 1024,
+        windowsHide: true,
+        timeout: 150000,
+    });
+    let response = String(result.stdout || '').trim();
+    let transcript = '';
+    if (!response) {
+        const extracted = _extractLatestAntigravityResponse(started);
+        response = extracted.response;
+        transcript = extracted.transcript;
+    }
+    if (!response) {
+        response = _callGeminiCliFallback(prompt, env, { label: `${opts?.label || 'generic'} after empty Antigravity response` });
+    }
+    if (response && _looksLikeCliFailureResponse(response)) {
+        logDebug(`[CLI LLM] provider=antigravity label=${opts?.label || 'generic'} falling back to gemini because Antigravity returned failure text`);
+        response = _callGeminiCliFallback(prompt, env, { label: `${opts?.label || 'generic'} after Antigravity failure text` });
+    }
+    if (opts?.jsonMode && response && !_looksLikeJsonObjectResponse(response)) {
+        logDebug(`[CLI LLM] provider=antigravity label=${opts?.label || 'generic'} falling back to gemini because JSON-mode response was not usable`);
+        response = _callGeminiCliFallback(prompt, env, { label: `${opts?.label || 'generic'} after non-JSON Antigravity response` });
+    }
+    logDebug(`[CLI LLM] provider=antigravity label=${opts?.label || 'generic'} responseChars=${response.length}${transcript ? ` transcript=${transcript}` : ''}`);
+    return response;
+}
+
+async function _callAntigravityPlanner(systemPrompt: string, userMsg: string): Promise<string> {
+    return _callAntigravityCli(systemPrompt, userMsg, { jsonMode: true, label: 'CEO Planner' });
 }
 
 const CEO_CLASSIFIER_PROMPT = _loadPrompt('ceo-classifier.md');
 const SECRETARY_TELEGRAM_PROMPT = _loadPrompt('secretary-telegram.md');
 async function classifyToAgent(text: string): Promise<string> {
-    try {
-        const out = await _quickLLMCall(_personalizePrompt(CEO_CLASSIFIER_PROMPT), text, 16);
-        const id = out.trim().toLowerCase().replace(/[^a-z]/g, '');
-        if (AGENTS[id]) return id;
-    } catch { /* fall through to keyword router */ }
     const lower = text.toLowerCase();
     if (/유튜브|youtube|영상|채널|구독|썸네일/.test(lower)) return 'youtube';
     if (/인스타|instagram|릴스|피드|reel/.test(lower)) return 'instagram';
@@ -2038,6 +2458,14 @@ async function classifyToAgent(text: string): Promise<string> {
     if (/편집|자막|b-?roll|컷/.test(lower)) return 'editor';
     if (/카피|스크립트|블로그|후크|글/.test(lower)) return 'writer';
     if (/트렌드|리서치|조사|뉴스/.test(lower)) return 'researcher';
+    if (!getConfig().localLlmEnabled) {
+        return 'secretary';
+    }
+    try {
+        const out = await _quickLLMCall(_personalizePrompt(CEO_CLASSIFIER_PROMPT), text, 16);
+        const id = out.trim().toLowerCase().replace(/[^a-z]/g, '');
+        if (AGENTS[id]) return id;
+    } catch { /* fall through to safe default */ }
     return 'secretary'; // safe default — secretary triages
 }
 
@@ -2233,8 +2661,26 @@ async function handleTelegramCommand(text: string): Promise<void> {
    small models often emit a "thinking" / scratchpad JSON before the real
    answer, and the legacy first-only behavior would lock onto the scratchpad
    and leak it (or trigger an empty-reply fallback). */
-function _extractFirstJsonObject(raw: string): any | null {
-    if (!raw) return null;
+function _parseJsonCandidate(raw: string): any | null {
+    try {
+        const obj = JSON.parse(raw);
+        return obj && typeof obj === 'object' ? obj : null;
+    } catch {
+        /* Rescue common model output on Windows: bare C:\Users\... paths
+           inside JSON strings. Strict JSON remains preferred; this only runs
+           after normal parsing fails. */
+        try {
+            const rescued = String(raw).replace(/\\/g, '\\\\');
+            const obj = JSON.parse(rescued);
+            return obj && typeof obj === 'object' ? obj : null;
+        } catch {
+            return null;
+        }
+    }
+}
+
+function _extractJsonObjects(raw: string): any[] {
+    if (!raw) return [];
     /* Strip code fences first */
     const stripped = raw.replace(/```[a-zA-Z]*\n?|```/g, '');
     const candidates: any[] = [];
@@ -2259,12 +2705,15 @@ function _extractFirstJsonObject(raw: string): any | null {
             }
         }
         if (endIdx < 0) break; // unbalanced trailing object — let the caller's truncation rescue handle it
-        try {
-            const obj = JSON.parse(stripped.slice(start, endIdx + 1));
-            if (obj && typeof obj === 'object') candidates.push(obj);
-        } catch { /* skip malformed object, continue scanning */ }
+        const obj = _parseJsonCandidate(stripped.slice(start, endIdx + 1));
+        if (obj) candidates.push(obj);
         i = endIdx + 1;
     }
+    return candidates;
+}
+
+function _extractFirstJsonObject(raw: string): any | null {
+    const candidates = _extractJsonObjects(raw);
     if (candidates.length === 0) return null;
     const withMode = candidates.find(c => typeof c.mode === 'string');
     return withMode || candidates[0];
@@ -2833,7 +3282,7 @@ function _scheduleTick() {
         const sch = readReportSchedule();
         if (sch.entries.length === 0) return;
         const now = new Date();
-        const today = now.toISOString().slice(0, 10);
+        const today = kstDate(now);
         const dow = now.getDay();
         const hour = now.getHours();
         const minute = now.getMinutes();
@@ -3684,7 +4133,7 @@ async function _runDailyBriefingOnce(force = false): Promise<void> {
         if (!time && !force) return; // off
         const { token, chatId } = readTelegramConfig();
         if (!token || !chatId) return; // no channel
-        const today = new Date().toISOString().slice(0, 10);
+        const today = kstDate();
         const lastSent = _extCtx?.globalState.get<string>(_DAILY_BRIEFING_KEY, '');
         if (!force && lastSent === today) return; // already sent today
 
@@ -3714,7 +4163,7 @@ async function _runDailyBriefingOnce(force = false): Promise<void> {
         /* 3. Yesterday highlights — last 800 chars of yesterday's log */
         let yhBlock = '';
         try {
-            const yest = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+            const yest = kstDateDaysAgo(1);
             const ypath = path.join(getConversationsDir(), `${yest}.md`);
             const txt = _safeReadText(ypath);
             if (txt.trim()) {
@@ -4275,7 +4724,7 @@ createRoot(document.getElementById('root')!).render(<App />);
         fs.writeFileSync(path.join(root, 'README.md'),
 `# ${safe}
 
-Developer 에이전트가 ${new Date().toISOString().slice(0, 10)}에 만든 프로젝트.
+Developer 에이전트가 ${kstDate()}에 만든 프로젝트.
 템플릿: \`${template}\`
 
 ## 다음 스텝
@@ -4292,7 +4741,7 @@ ${template === 'static'
 
 _Developer 에이전트와 사용자가 내린 디자인·기술 의사결정이 시간순으로 누적됩니다._
 
-## [${new Date().toISOString().slice(0, 10)}] 프로젝트 생성
+## [${kstDate()}] 프로젝트 생성
 - 템플릿: \`${template}\`
 - 위치: \`${path.relative(getCompanyDir(), root)}\`
 `);
@@ -5064,6 +5513,1001 @@ function _safeReadText(p: string): string {
   try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; }
 }
 
+function readConnectAiPermanentOperatingMemory(opts?: { lean?: boolean }): string {
+  const candidates = [
+    path.join(_getBrainDir(), 'agent-guides', 'connect-ai-permanent-operating-memory.md'),
+    path.join(os.homedir(), 'connect-ai-vault', 'agent-guides', 'connect-ai-permanent-operating-memory.md'),
+  ];
+  for (const p of candidates) {
+    const txt = _safeReadText(p).trim();
+    if (!txt) continue;
+    const maxChars = opts?.lean ? 1800 : 7000;
+    return `\n\n[Connect AI 영구 운영 기준 메모리 — 최우선, 모든 작업 전 준수]\n출처: ${p}\n${txt.slice(0, maxChars)}`;
+  }
+  return '';
+}
+
+type AgentQueueAssignee = 'codex' | 'claude' | 'hermes' | 'gemini' | 'antigravity' | 'local-llm';
+type AgentQueueStatus = 'queued' | 'copied' | 'running' | 'ready_for_verification' | 'done' | 'blocked';
+type AgentQueuePriority = 'P0' | 'P1' | 'P2';
+type AgentDispatchExecutor = 'auto' | 'codex' | 'antigravity' | 'gemini' | 'local-llm';
+type AgentTaskRole = 'implementer' | 'reviewer' | 'researcher' | 'verifier' | 'local-smoke';
+
+interface AgentQueueItem {
+    id: string;
+    title: string;
+    assignee: AgentQueueAssignee;
+    status: AgentQueueStatus;
+    priority: AgentQueuePriority;
+    files: string[];
+    prompt: string;
+    resultSummary: string;
+    createdAt: string;
+    updatedAt: string;
+    verifiedAt?: string;
+    completedAt?: string;
+    claimedBy?: string;
+    claimedAt?: string;
+    role?: AgentTaskRole | string;
+    workerClass?: string;
+    riskClass?: 'Green' | 'Yellow' | 'Red' | string;
+    allowedAssignees?: string[];
+    requiresHumanApproval?: boolean;
+    writeScope?: string[];
+    forbiddenPaths?: string[];
+    risk?: 'Green' | 'Yellow' | 'Red' | string;
+    executor?: string;
+    reviewer?: string;
+    intent?: string;
+    expectedTests?: string[];
+    rollbackPath?: string;
+    stopCondition?: string;
+    approvalCondition?: string;
+    evidenceRequired?: string[];
+    tokenBudget?: string;
+    retryBudget?: number;
+    canWrite?: boolean;
+    agentOsStatus?: 'QUEUED' | 'READY_FOR_VERIFICATION' | 'VERIFIED' | 'PARTIAL' | 'BLOCKED' | string;
+}
+
+interface WorkerStatusItem {
+    agent: AgentQueueAssignee | string;
+    workerClass: string;
+    label: string;
+    status: string;
+    phase: string;
+    message: string;
+    taskId: string;
+    taskTitle: string;
+    updatedAt: string;
+}
+
+interface WorkerHealthPayload {
+    generatedAt?: string;
+    agents?: Record<string, {
+        agent?: string;
+        workerClass?: string;
+        status?: string;
+        detail?: string;
+        latencyMs?: number;
+        updatedAt?: string;
+    }>;
+}
+
+function readPlannerHealthForUi(): { status: string; directStatus: string; source: string; detail: string } {
+    const provider = getConfig().plannerProvider;
+    const health = readWorkerHealth();
+    const antigravity = health.agents?.antigravity;
+    const status = _sanitizeQueueText(antigravity?.status || 'UNKNOWN', 40);
+    const detail = _sanitizeQueueText(antigravity?.detail || '', 180);
+    if (provider === 'local') {
+        return { status: 'LOCAL', directStatus: 'LOCAL', source: 'local', detail: 'Local LLM planner is selected.' };
+    }
+    if (/RATE_LIMITED|QUOTA/i.test(status) || /RESOURCE_EXHAUSTED|quota|429/i.test(detail)) {
+        return { status, directStatus: 'SKIPPED_RATE_LIMITED', source: 'gemini-fallback', detail };
+    }
+    if (/AUTH_EXPIRED|LOGIN|NOT_LOGGED/i.test(status) || /not logged|auth|login/i.test(detail)) {
+        return { status, directStatus: 'AUTH_EXPIRED', source: 'none', detail };
+    }
+    return { status, directStatus: status === 'READY' ? 'READY' : status, source: 'antigravity', detail };
+}
+
+function buildConnectAiReadinessSummary(): {
+    verdict: string;
+    usableForGreenChat: boolean;
+    reason: string;
+    text: string;
+} {
+    const queue = readAgentQueue();
+    const counts: Record<string, number> = {};
+    for (const item of queue) counts[item.status || 'unknown'] = (counts[item.status || 'unknown'] || 0) + 1;
+    const planner = readPlannerHealthForUi();
+    const blocked = queue.filter(item => item.status === 'blocked');
+    const archiveCandidates = blocked.filter(item => /superseded|duplicate|대체|중복/i.test(`${item.resultSummary}\n${item.title}`)).length;
+    const hasActive = (counts.queued || 0) > 0 || (counts.running || 0) > 0 || (counts.copied || 0) > 0;
+    const localLlmDefault = getConfig().localLlmEnabled;
+    const plannerProvider = getConfig().plannerProvider;
+
+    let verdict = 'READY';
+    let usableForGreenChat = true;
+    let reason = 'Green 작업을 받을 수 있는 상태입니다.';
+    if (plannerProvider !== 'antigravity' || localLlmDefault) {
+        verdict = 'NEEDS_TRIAGE';
+        usableForGreenChat = false;
+        reason = 'planner/local LLM 설정이 안전 운영 기준과 다릅니다.';
+    } else if (planner.source === 'none' || /AUTH_EXPIRED/i.test(planner.directStatus)) {
+        verdict = 'NEEDS_TRIAGE';
+        usableForGreenChat = false;
+        reason = 'Antigravity 인증 상태 확인이 필요합니다.';
+    } else if (hasActive) {
+        verdict = 'BUSY_BUT_USABLE';
+        reason = `큐에 활성 작업이 있습니다: queued=${counts.queued || 0}, running=${counts.running || 0}, copied=${counts.copied || 0}.`;
+    } else if (planner.source === 'gemini-fallback' || /RATE_LIMITED|QUOTA|SKIPPED_RATE_LIMITED/i.test(`${planner.status}\n${planner.directStatus}\n${planner.detail}`)) {
+        verdict = 'LIMITED_READY';
+        reason = 'Antigravity direct는 제한 상태지만 Gemini fallback으로 Green 작업은 가능합니다.';
+    }
+
+    const text = [
+        `판정: ${verdict}`,
+        `Green chat 사용 가능: ${usableForGreenChat ? 'YES' : 'NO'}`,
+        `이유: ${reason}`,
+        '',
+        `큐: total ${queue.length}, queued ${counts.queued || 0}, running ${counts.running || 0}, copied ${counts.copied || 0}, blocked ${counts.blocked || 0}, done ${counts.done || 0}`,
+        `planner: ${plannerProvider}, source=${planner.source}, direct=${planner.directStatus}, localLlmEnabled=${localLlmDefault}`,
+        `blocked: ${blocked.length}건, archive 후보 추정 ${archiveCandidates}건`,
+        '',
+        '다음 행동:',
+        planner.source === 'gemini-fallback'
+            ? '- Antigravity quota가 풀릴 때까지 Gemini fallback 유지.'
+            : '- Planner 상태 정상 여부를 주기적으로 확인.',
+        '- 새 Green 작업은 Connect Chat에서 지시 가능. 파일 수정/worker 실행 허용 여부를 명시.',
+        '- Red/high-risk, protected path, 승인/토큰/주문/배포 작업은 사용자 직접 승인 전까지 실행 금지.',
+    ].join('\n');
+
+    return { verdict, usableForGreenChat, reason, text };
+}
+
+function _agentQueuePath(): string {
+    const storageRoot = _extCtx?.globalStorageUri?.fsPath
+        || (process.env.APPDATA
+            ? path.join(process.env.APPDATA, 'Code', 'User', 'globalStorage', 'connectailab.connect-ai-lab')
+            : path.join(os.homedir(), '.connect-ai', 'globalStorage', 'connectailab.connect-ai-lab'));
+    return path.join(storageRoot, 'phase3', 'agent-queue.json');
+}
+
+function _phase3StoragePath(fileName: string): string {
+    return path.join(path.dirname(_agentQueuePath()), fileName);
+}
+
+function _sanitizeQueueText(value: unknown, maxLen = 6000): string {
+    let text = typeof value === 'string' ? value : String(value ?? '');
+    text = text.replace(/\b((?:token|secret|password|passwd|api[_-]?key|client[_-]?secret|authorization|cookie|localStorage)\b\s*[:=]\s*)["']?[^"'\s,}]+/gi, '$1<redacted>');
+    text = text.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, 'Bearer <redacted>');
+    text = text.trim();
+    return text.length > maxLen ? text.slice(0, maxLen) + '\n...[truncated]' : text;
+}
+
+function _coerceAgentQueueStatus(value: unknown): AgentQueueStatus {
+    return ['queued', 'copied', 'running', 'ready_for_verification', 'done', 'blocked'].includes(String(value)) ? String(value) as AgentQueueStatus : 'queued';
+}
+
+function _coerceAgentQueueAssignee(value: unknown): AgentQueueAssignee {
+    return ['codex', 'claude', 'hermes', 'gemini', 'antigravity', 'local-llm'].includes(String(value)) ? String(value) as AgentQueueAssignee : 'codex';
+}
+
+function _coerceAgentQueuePriority(value: unknown): AgentQueuePriority {
+    return ['P0', 'P1', 'P2'].includes(String(value)) ? String(value) as AgentQueuePriority : 'P1';
+}
+
+interface AgentDispatchCommandInput {
+    goal?: string;
+    executor?: AgentDispatchExecutor;
+    files?: string[];
+    writeScope?: string[];
+    expectedTests?: string[];
+    rollbackPath?: string;
+    risk?: 'Green' | 'Yellow' | 'Red' | string;
+    priority?: AgentQueuePriority;
+}
+
+function _extractAgentDispatchOption(body: string, key: string): { body: string; values: string[] } {
+    const values: string[] = [];
+    const pattern = new RegExp(`(^|\\s)(?:--${key}\\s+|${key}=)(?:"([^"]+)"|'([^']+)'|([^\\s]+))`, 'gi');
+    const next = body.replace(pattern, (match, prefix, quotedDouble, quotedSingle, bare) => {
+        values.push(_sanitizeQueueText(quotedDouble || quotedSingle || bare || '', 400));
+        return prefix || ' ';
+    });
+    return { body: next.replace(/\s+/g, ' ').trim(), values: values.filter(Boolean) };
+}
+
+function parseAgentDispatchShortcut(raw: string): AgentDispatchCommandInput | null {
+    const text = String(raw || '').trim();
+    const prefix = text.match(/^(?:\/(?:agentos|agent|dispatch|queue)\b|(?:agent\s*os|queue|큐)\s*(?:dispatch|디스패치)|작업\s*(?:시켜|하달|맡겨|등록)|(?:worker|워커)\s*(?:하달|등록|시켜)|큐\s*(?:등록|하달|넣어|추가)|에이전트\s*작업)\s*[:：-]?\s*/i);
+    if (!prefix) return null;
+
+    let body = text.slice(prefix[0].length).trim();
+    const executorOpt = _extractAgentDispatchOption(body, 'executor');
+    body = executorOpt.body;
+    const fileOpt = _extractAgentDispatchOption(body, 'file');
+    body = fileOpt.body;
+    const scopeOpt = _extractAgentDispatchOption(body, 'writeScope');
+    body = scopeOpt.body;
+    const riskOpt = _extractAgentDispatchOption(body, 'risk');
+    body = riskOpt.body;
+    const priorityOpt = _extractAgentDispatchOption(body, 'priority');
+    body = priorityOpt.body;
+
+    const goalOpt = _extractAgentDispatchOption(body, 'goal');
+    body = goalOpt.values[0] || goalOpt.body;
+    const goal = _sanitizeQueueText(body, 4000).replace(/\s+/g, ' ').trim();
+    if (!goal) return null;
+
+    const executor = (executorOpt.values[0] || 'auto').toLowerCase() as AgentDispatchExecutor;
+    const priority = (priorityOpt.values[0] || 'P2').toUpperCase() as AgentQueuePriority;
+    return {
+        goal,
+        executor: ['auto', 'codex', 'antigravity', 'gemini', 'local-llm'].includes(executor) ? executor : 'auto',
+        files: fileOpt.values,
+        writeScope: scopeOpt.values,
+        risk: riskOpt.values[0],
+        priority: ['P0', 'P1', 'P2'].includes(priority) ? priority : 'P2',
+    };
+}
+
+function _agentDispatchStamp(): string {
+    return new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+}
+
+function _agentDispatchId(): string {
+    return `aq-${_agentDispatchStamp()}-${Math.random().toString(16).slice(2, 8).padEnd(6, '0')}`;
+}
+
+function _isPathInside(childPath: string, parentPath: string): boolean {
+    const child = path.resolve(childPath);
+    const parent = path.resolve(parentPath);
+    const rel = path.relative(parent, child);
+    return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function _assertNoDirectVaultWrites(pathsToCheck: string[]): void {
+    const roots = [
+        _getBrainDir(),
+        path.join(os.homedir(), 'connect-ai-vault'),
+    ].map(p => path.resolve(p));
+    for (const candidate of pathsToCheck) {
+        const abs = path.resolve(candidate);
+        if (roots.some(root => _isPathInside(abs, root))) {
+            throw new Error(`direct Obsidian vault writes are forbidden for Agent OS dispatch: ${candidate}`);
+        }
+    }
+}
+
+function assertAgentFileToolNotVaultWrite(candidate: string, actionTag: string): void {
+    const roots = [
+        _getBrainDir(),
+        path.join(os.homedir(), 'connect-ai-vault'),
+    ].map(p => path.resolve(p));
+    const abs = path.resolve(candidate);
+    if (roots.some(root => _isPathInside(abs, root))) {
+        throw new Error(
+            `direct Obsidian vault writes are forbidden for ${actionTag}: ${candidate}. ` +
+            `Durable notes must use brain-inject/memory-bridge or vault-writer; ` +
+            `agent/runtime output must stay in companyDir.`
+        );
+    }
+}
+
+function _selectAgentDispatchExecutor(goal: string, requested: AgentDispatchExecutor = 'auto'): AgentQueueAssignee {
+    if (requested === 'codex' || requested === 'antigravity' || requested === 'gemini' || requested === 'local-llm') return requested;
+    const text = goal || '';
+    if (/\b(design|review|architecture|critique|plan)\b|설계|검토|비평|아키텍처/i.test(text)) return 'antigravity';
+    if (/\b(lint|format|comment|classify|classification|label|smoke)\b|주석|분류|라벨|간단/i.test(text)) return 'local-llm';
+    return 'codex';
+}
+
+function _workerClassForDispatch(executor: AgentQueueAssignee): string {
+    if (executor === 'local-llm') return 'local-smoke';
+    if (executor === 'antigravity' || executor === 'gemini') return 'reviewer';
+    if (executor === 'hermes') return 'observer';
+    return 'executor';
+}
+
+function _roleForDispatch(executor: AgentQueueAssignee): AgentTaskRole {
+    if (executor === 'local-llm') return 'local-smoke';
+    if (executor === 'antigravity' || executor === 'gemini') return 'reviewer';
+    if (executor === 'hermes') return 'researcher';
+    return 'implementer';
+}
+
+function _stopConditionForDispatch(executor: AgentQueueAssignee): string {
+    if (executor === 'local-llm') return 'Stop after one read-only smoke result, missing required evidence, or any write claim.';
+    return 'Stop when retry budget is exhausted, a forbidden-path policy violation appears, required evidence is missing, or the same failure repeats.';
+}
+
+function _approvalConditionForDispatch(executor: AgentQueueAssignee): string {
+    if (executor === 'codex') return 'Human approval is required before credential access, deploy/external-send actions, direct vault write, risky write, or write-scope expansion.';
+    return 'Human approval is required before any write, credential access, deploy/external-send action, direct vault write, or scope expansion.';
+}
+
+function _evidenceRequiredForDispatch(executor: AgentQueueAssignee): string[] {
+    if (executor === 'local-llm') return ['no-write confirmation', 'commands run', 'classification/smoke evidence', 'unresolved failures'];
+    return ['files changed or no-write confirmation', 'commands run', 'current-run expected tests/evidence', 'unresolved failures'];
+}
+
+function _defaultTokenBudgetForDispatch(executor: AgentQueueAssignee): string {
+    if (executor === 'local-llm') return 'local-zero';
+    if (executor === 'antigravity' || executor === 'gemini') return 'medium';
+    return 'small';
+}
+
+function _dispatchTargetFromInput(file: string | undefined, runDir: string): string {
+    if (!file || !file.trim()) return path.join(runDir, 'goal.md');
+    const resolved = _resolveFlexiblePath(file, getCompanyDir());
+    if (!resolved || resolved.reason) {
+        throw new Error(resolved?.reason || `target path could not be resolved: ${file}`);
+    }
+    return resolved.abs;
+}
+
+function _buildAgentDispatchPrompt(input: {
+    goal: string;
+    executor: AgentQueueAssignee;
+    risk: string;
+    writeScope: string[];
+    expectedTests: string[];
+    rollbackPath: string;
+    stopCondition: string;
+    approvalCondition: string;
+    evidenceRequired: string[];
+}): string {
+    const canWrite = input.executor === 'codex';
+    return [
+        '# Connect AI Extension Dispatch',
+        '',
+        'You are receiving one bounded Connect AI queue item from the VS Code command surface.',
+        'Do not route this task onward. Do not write to the Obsidian vault.',
+        '',
+        `Goal: ${input.goal}`,
+        `Risk: ${input.risk}`,
+        `Allowed write scope: ${input.writeScope.join(', ')}`,
+        `Forbidden paths: ${_getBrainDir()}, ${path.join(os.homedir(), 'connect-ai-vault')}`,
+        `Expected tests/evidence: ${input.expectedTests.join('; ')}`,
+        `Rollback path: ${input.rollbackPath}`,
+        `Stop condition: ${input.stopCondition}`,
+        `Approval condition: ${input.approvalCondition}`,
+        `Evidence required: ${input.evidenceRequired.join('; ')}`,
+        '',
+        'Execution rule:',
+        canWrite
+            ? '- Make changes only inside the allowed write scope when your environment permits it.'
+            : '- Do not change files; return read-only smoke/classification evidence only.',
+        '- Report READY_FOR_VERIFICATION, never DONE. A separate verifier is S7 scope.',
+        '',
+        'Required result format:',
+        '```json',
+        JSON.stringify({
+            status: 'READY_FOR_VERIFICATION',
+            executor: input.executor,
+            filesChanged: canWrite ? input.writeScope : [],
+            commandsRun: [],
+            unresolvedFailures: [],
+            evidence: 'short current-run evidence',
+        }, null, 2),
+        '```',
+    ].join('\n');
+}
+
+function createAgentDispatchQueueItem(seed: AgentDispatchCommandInput): AgentQueueItem {
+    const goal = _sanitizeQueueText(seed.goal || '', 4000).replace(/\s+/g, ' ').trim();
+    if (!goal) throw new Error('Agent OS dispatch requires a goal.');
+    const requested = (seed.executor || 'auto') as AgentDispatchExecutor;
+    const executor = _selectAgentDispatchExecutor(goal, requested);
+    const runDir = path.join(getCompanyDir(), 'agent-dispatch', _agentDispatchStamp());
+    fs.mkdirSync(runDir, { recursive: true });
+
+    const files = (seed.files && seed.files.length ? seed.files : [''])
+        .map(file => _dispatchTargetFromInput(file, runDir));
+    const writeScope = seed.writeScope && seed.writeScope.length
+        ? seed.writeScope.map(file => _dispatchTargetFromInput(file, runDir))
+        : files;
+    _assertNoDirectVaultWrites([...files, ...writeScope]);
+
+    for (const file of files) {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        if (!fs.existsSync(file) && _isPathInside(file, getCompanyDir())) {
+            fs.writeFileSync(file, '# Agent dispatch target\n\nRuntime placeholder for a bounded Connect AI queue item.\n', 'utf-8');
+        }
+    }
+
+    const expectedTests = _safeStringArray(seed.expectedTests, 10);
+    const risk = _sanitizeQueueText(seed.risk || (executor === 'local-llm' ? 'Green' : 'Yellow'), 20);
+    const priority = _coerceAgentQueuePriority(seed.priority || 'P2');
+    const rollbackPath = _sanitizeQueueText(seed.rollbackPath || 'revert only the allowed write scope listed on this queue item', 1000);
+    const stopCondition = _stopConditionForDispatch(executor);
+    const approvalCondition = _approvalConditionForDispatch(executor);
+    const evidenceRequired = _evidenceRequiredForDispatch(executor);
+    const now = new Date().toISOString();
+    const prompt = _buildAgentDispatchPrompt({
+        goal,
+        executor,
+        risk,
+        writeScope,
+        expectedTests: expectedTests.length ? expectedTests : ['executor returns READY_FOR_VERIFICATION evidence'],
+        rollbackPath,
+        stopCondition,
+        approvalCondition,
+        evidenceRequired,
+    });
+
+    const item: AgentQueueItem = {
+        id: _agentDispatchId(),
+        title: goal.length > 96 ? `${goal.slice(0, 93)}...` : goal,
+        assignee: executor,
+        status: 'queued',
+        priority,
+        files,
+        prompt,
+        resultSummary: '',
+        createdAt: now,
+        updatedAt: now,
+        role: _roleForDispatch(executor),
+        workerClass: _workerClassForDispatch(executor),
+        riskClass: risk,
+        risk,
+        allowedAssignees: [executor],
+        requiresHumanApproval: risk === 'Red',
+        writeScope,
+        forbiddenPaths: [_getBrainDir(), path.join(os.homedir(), 'connect-ai-vault')],
+        executor,
+        reviewer: 'pending-s7',
+        intent: `extension-dispatch-${executor}`,
+        expectedTests: expectedTests.length ? expectedTests : ['executor returns READY_FOR_VERIFICATION evidence'],
+        rollbackPath,
+        stopCondition: _stopConditionForDispatch(executor),
+        approvalCondition: _approvalConditionForDispatch(executor),
+        evidenceRequired: _evidenceRequiredForDispatch(executor),
+        tokenBudget: _defaultTokenBudgetForDispatch(executor),
+        retryBudget: 1,
+        canWrite: executor === 'codex',
+        agentOsStatus: 'QUEUED',
+    };
+
+    const queue = readAgentQueue();
+    queue.push(item);
+    writeAgentQueue(queue);
+    return item;
+}
+
+function formatAgentDispatchShortcutResponse(item: AgentQueueItem): string {
+    return [
+        `🧭 Agent OS queue item ${item.id}`,
+        '',
+        `executor: ${item.assignee}`,
+        `status: ${item.status}`,
+        `agentOsStatus: ${item.agentOsStatus || 'QUEUED'}`,
+        `reviewer: ${item.reviewer || 'pending-s7'}`,
+        `expected: ${(item.expectedTests || []).join('; ') || 'executor returns READY_FOR_VERIFICATION evidence'}`,
+        '',
+        'Executor는 DONE이 아니라 READY_FOR_VERIFICATION까지만 보고합니다. S7 verifier 분리 전까지 최종 완료 판정은 보류됩니다.',
+    ].join('\n');
+}
+
+type AgentVerificationReviewer = 'gemini' | 'antigravity';
+
+function _verificationMarkerFor(source: AgentQueueItem): string {
+    return `[verify-source:${source.id}]`;
+}
+
+function _hasActiveVerifierFor(queue: AgentQueueItem[], source: AgentQueueItem): boolean {
+    const marker = _verificationMarkerFor(source);
+    return queue.some(item => {
+        if (item.role !== 'verifier' || item.intent !== 'verification') return false;
+        if (!`${item.prompt}\n${item.resultSummary}`.includes(marker)) return false;
+        return ['queued', 'copied', 'running', 'ready_for_verification'].includes(item.status);
+    });
+}
+
+function _buildAgentVerificationPrompt(source: AgentQueueItem): string {
+    const files = source.files && source.files.length ? source.files.map(file => `- ${file}`).join('\n') : '- (no explicit files listed)';
+    const writeScope = source.writeScope && source.writeScope.length ? source.writeScope.map(scope => `- ${scope}`).join('\n') : '- (not specified)';
+    const expectedTests = source.expectedTests && source.expectedTests.length ? source.expectedTests.map(test => `- ${test}`).join('\n') : '- (not specified)';
+    return [
+        _verificationMarkerFor(source),
+        'You are a Connect AI read-only verifier.',
+        'Do not edit, create, delete, move, send, deploy, authenticate, approve, or mutate queue state.',
+        'Do not claim the source task is done unless evidence proves it.',
+        'Review the worker result and return Korean markdown with:',
+        '1. 검증 판정: accept / reject / needs_human',
+        '2. 근거',
+        '3. 누락 증거',
+        '4. 권장 다음 조치',
+        'Use these exact heading labels; do not rename them:',
+        '검증 판정: accept|reject|needs_human',
+        '근거:',
+        '누락 증거:',
+        '권장 다음 조치:',
+        '',
+        `Source task id: ${source.id}`,
+        `Source assignee: ${source.assignee}`,
+        `Source title: ${source.title}`,
+        `Source priority: ${source.priority}`,
+        `Source status: ${source.status}`,
+        '',
+        'Source queue contract:',
+        `riskClass: ${source.riskClass || source.risk || '(not specified)'}`,
+        `executor: ${source.executor || '(not specified)'}`,
+        `reviewer: ${source.reviewer || '(not specified)'}`,
+        `rollbackPath: ${source.rollbackPath || '(not specified)'}`,
+        'writeScope:',
+        writeScope,
+        'expectedTests:',
+        expectedTests,
+        '',
+        'Files / write scope:',
+        files,
+        '',
+        'Worker result summary:',
+        _sanitizeQueueText(source.resultSummary || '', 5000),
+    ].join('\n');
+}
+
+function createAgentVerificationQueueItems(options: { reviewer?: AgentVerificationReviewer | 'auto'; max?: number } = {}): AgentQueueItem[] {
+    const queue = readAgentQueue();
+    const max = Math.max(1, Math.min(20, Math.floor(Number(options.max || 3))));
+    const sources = queue.filter(item => item.status === 'ready_for_verification' && !_hasActiveVerifierFor(queue, item));
+    const created: AgentQueueItem[] = [];
+    for (const source of sources.slice(0, max)) {
+        const reviewer: AgentVerificationReviewer = options.reviewer === 'gemini' || options.reviewer === 'antigravity'
+            ? options.reviewer
+            : (created.length % 2 === 0 ? 'gemini' : 'antigravity');
+        const now = new Date().toISOString();
+        const verifier: AgentQueueItem = {
+            id: _agentDispatchId(),
+            title: `Verification request: ${source.title}`.slice(0, 160),
+            assignee: reviewer,
+            status: 'queued',
+            priority: source.priority || 'P1',
+            files: source.files || [],
+            prompt: _buildAgentVerificationPrompt(source),
+            resultSummary: '',
+            createdAt: now,
+            updatedAt: now,
+            role: 'verifier',
+            workerClass: 'reviewer',
+            riskClass: 'Green',
+            risk: 'Green',
+            allowedAssignees: [reviewer],
+            requiresHumanApproval: false,
+            writeScope: ['read-only'],
+            forbiddenPaths: [_getBrainDir(), path.join(os.homedir(), 'connect-ai-vault'), 'transport-audit', 'swarm-status', 'readiness', 'dashboard/audit features'],
+            executor: 'none',
+            reviewer,
+            intent: 'verification',
+            expectedTests: ['reviewer returns explicit 검증 판정: accept|reject|needs_human'],
+            rollbackPath: 'delete verifier queue item before execution',
+            stopCondition: 'Stop after one read-only verdict; do not mutate source queue state.',
+            approvalCondition: 'Human approval is required before any write, credential access, external send, or source task approval beyond explicit verifier verdict.',
+            evidenceRequired: ['검증 판정: accept|reject|needs_human', '근거', '누락 증거'],
+            tokenBudget: 'medium',
+            retryBudget: 0,
+            canWrite: false,
+            agentOsStatus: 'QUEUED',
+        };
+        queue.push(verifier);
+        created.push(verifier);
+    }
+    if (created.length) writeAgentQueue(queue);
+    return created;
+}
+
+type AgentVerificationVerdict = 'accept' | 'reject' | 'needs_human';
+
+function _sourceIdFromVerificationText(text: string): string {
+    const match = String(text || '').match(/\[verify-source:([^\]\s]+)\]/);
+    return match ? match[1] : '';
+}
+
+function _exactVerificationVerdict(value: string): AgentVerificationVerdict | '' {
+    const token = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+    if (token === 'accept' || token === 'reject' || token === 'needs_human') return token;
+    return '';
+}
+
+function _verificationVerdictFromSummary(summary: string): AgentVerificationVerdict | '' {
+    const text = String(summary || '');
+    const match = /(?:^|\n)\s*(?:#+\s*)?(?:\d+[.)]?\s*)?(?:검증\s*판정|심사\s*결과|verification\s*verdict|verdict)\s*[:：]\s*([^\r\n]*)/i.exec(text);
+    if (!match) return '';
+    const inline = _exactVerificationVerdict(match[1]);
+    if (inline) return inline;
+    const afterLine = text.slice(match.index + match[0].length);
+    const nextNonEmpty = afterLine.split(/\r?\n/).map(line => line.trim()).find(Boolean);
+    return _exactVerificationVerdict(nextNonEmpty || '');
+}
+
+function _hasVerificationEvidenceSections(summary: string): boolean {
+    const text = String(summary || '');
+    return Boolean(
+        _verificationVerdictFromSummary(text)
+        && /(?:^|\n)\s*(?:#+\s*)?(?:\d+[.)]?\s*)?(?:근거|증거|evidence)\s*[:：]\s*\S/i.test(text)
+        && /(?:^|\n)\s*(?:#+\s*)?(?:\d+[.)]?\s*)?(?:누락\s*증거|잔여\s*위험(?:\s*평가)?|missing\s*evidence|unresolved\s*failures?)\s*[:：]\s*\S/i.test(text)
+    );
+}
+
+function _isVerifiedVerifierTask(item: AgentQueueItem): boolean {
+    return Boolean(
+        item.role === 'verifier'
+        && item.intent === 'verification'
+        && item.status === 'done'
+        && item.verifiedAt
+        && _sourceIdFromVerificationText(`${item.prompt}\n${item.resultSummary}`)
+        && _hasVerificationEvidenceSections(item.resultSummary)
+    );
+}
+
+function _timestampMs(value?: string): number {
+    const ms = Date.parse(String(value || ''));
+    return Number.isFinite(ms) ? ms : 0;
+}
+
+function _isFreshVerifierForSource(verifier: AgentQueueItem, source: AgentQueueItem): boolean {
+    const sourceMs = Math.max(_timestampMs(source.updatedAt), _timestampMs(source.completedAt), _timestampMs(source.createdAt));
+    if (!sourceMs) return true;
+    const verifierMs = Math.max(_timestampMs(verifier.verifiedAt), _timestampMs(verifier.updatedAt), _timestampMs(verifier.completedAt), _timestampMs(verifier.createdAt));
+    return verifierMs >= sourceMs;
+}
+
+function _verificationClosureSummary(source: AgentQueueItem, verifier: AgentQueueItem, verdict: AgentVerificationVerdict): string {
+    const label = verdict === 'accept' ? 'VERIFIER_ACCEPT' : verdict === 'reject' ? 'VERIFIER_REJECT' : 'VERIFIER_NEEDS_HUMAN';
+    return _sanitizeQueueText([
+        `${label}: ${verifier.assignee} reviewed ${source.id}.`,
+        `Verifier task: ${verifier.id}`,
+        `Source task: ${source.id} - ${source.title}`,
+        '',
+        'Verifier evidence:',
+        verifier.resultSummary,
+    ].join('\n'), 3000);
+}
+
+function applyAgentVerificationEvidence(options: { execute?: boolean; max?: number } = {}): { planned: Array<{ sourceId: string; verifierId: string; reviewer: string; verdict: AgentVerificationVerdict; targetStatus: AgentQueueStatus }>; applied: AgentQueueItem[] } {
+    const queue = readAgentQueue();
+    const max = Math.max(1, Math.min(20, Math.floor(Number(options.max || 20))));
+    const evidenceBySource = new Map<string, AgentQueueItem>();
+    for (const verifier of queue) {
+        if (!_isVerifiedVerifierTask(verifier)) continue;
+        const sourceId = _sourceIdFromVerificationText(`${verifier.prompt}\n${verifier.resultSummary}`);
+        if (sourceId && !evidenceBySource.has(sourceId)) evidenceBySource.set(sourceId, verifier);
+    }
+    const planned: Array<{ sourceId: string; verifierId: string; reviewer: string; verdict: AgentVerificationVerdict; targetStatus: AgentQueueStatus }> = [];
+    const applied: AgentQueueItem[] = [];
+    for (const source of queue) {
+        if (planned.length >= max) break;
+        if (source.status !== 'ready_for_verification' && !(source.status === 'done' && !source.verifiedAt)) continue;
+        const verifier = evidenceBySource.get(source.id);
+        if (!verifier || !_isFreshVerifierForSource(verifier, source)) continue;
+        const verdict = _verificationVerdictFromSummary(verifier.resultSummary);
+        if (!verdict) continue;
+        const targetStatus: AgentQueueStatus = verdict === 'accept' ? 'done' : 'blocked';
+        planned.push({ sourceId: source.id, verifierId: verifier.id, reviewer: verifier.assignee, verdict, targetStatus });
+        if (options.execute) {
+            const now = new Date().toISOString();
+            source.status = targetStatus;
+            source.resultSummary = _verificationClosureSummary(source, verifier, verdict);
+            source.updatedAt = now;
+            source.completedAt = now;
+            if (targetStatus === 'done') {
+                source.agentOsStatus = 'DONE';
+                source.verifiedAt = now;
+            } else {
+                source.agentOsStatus = 'BLOCKED';
+            }
+            applied.push(source);
+        }
+    }
+    if (options.execute && applied.length) writeAgentQueue(queue);
+    return { planned, applied };
+}
+
+async function runAgentDispatchGoalCommand(seed?: AgentDispatchCommandInput): Promise<AgentQueueItem | undefined> {
+    const goal = seed?.goal || await vscode.window.showInputBox({
+        prompt: 'Connect AI Agent OS에 맡길 목표를 입력하세요.',
+        placeHolder: '예: 이 파일의 TODO를 정리하고 테스트를 실행해줘',
+        ignoreFocusOut: true,
+    });
+    if (!goal) return undefined;
+
+    let executor = seed?.executor;
+    if (!executor) {
+        const picked = await vscode.window.showQuickPick([
+            { label: 'auto', description: '목표를 보고 codex / antigravity / gemini / local-llm 중 선택' },
+            { label: 'codex', description: '코드 변경, 통합, 테스트' },
+            { label: 'antigravity', description: '설계/리뷰. broker routing은 별도 담당' },
+            { label: 'gemini', description: '명시 Gemini CLI executor. 모델별 경로는 큐 runner가 처리' },
+            { label: 'local-llm', description: '짧은 분류, lint/comment smoke. 파일 쓰기 없음' },
+        ], { placeHolder: 'Executor route', ignoreFocusOut: true });
+        executor = (picked?.label || 'auto') as AgentDispatchExecutor;
+    }
+
+    let files = seed?.files;
+    if (!files || files.length === 0) {
+        const file = await vscode.window.showInputBox({
+            prompt: '대상 파일 또는 경로를 입력하세요. 비우면 companyDir 런타임 placeholder를 사용합니다.',
+            placeHolder: path.join(getCompanyDir(), 'agent-dispatch', 'goal.md'),
+            ignoreFocusOut: true,
+        });
+        files = file ? [file] : [];
+    }
+
+    const item = createAgentDispatchQueueItem({ ...seed, goal, executor, files });
+    _taskTreeProvider?.refresh();
+    const message = `Agent OS queue item ${item.id} → ${item.assignee} · ${item.status}`;
+    _activeChatProvider?.injectSystemMessage(`🧭 ${message}\n\n${item.title}`);
+    const action = await vscode.window.showInformationMessage(message, '큐 보기');
+    if (action === '큐 보기') {
+        _dashboardExtensionUri = _extCtx?.extensionUri || _dashboardExtensionUri;
+        if (_dashboardExtensionUri) CompanyDashboardPanel.createOrShow(_dashboardExtensionUri);
+    }
+    return item;
+}
+
+async function runAgentDispatchVerificationCommand(seed?: { reviewer?: AgentVerificationReviewer | 'auto'; max?: number }): Promise<AgentQueueItem[]> {
+    let reviewer = seed?.reviewer;
+    if (!reviewer) {
+        const picked = await vscode.window.showQuickPick([
+            { label: 'auto', description: 'Gemini / Antigravity verifier를 번갈아 사용' },
+            { label: 'gemini', description: 'Gemini read-only verifier task 생성' },
+            { label: 'antigravity', description: 'Antigravity read-only verifier task 생성' },
+        ], { placeHolder: 'Verifier route', ignoreFocusOut: true });
+        reviewer = (picked?.label || 'auto') as AgentVerificationReviewer | 'auto';
+    }
+    const created = createAgentVerificationQueueItems({ reviewer, max: seed?.max || 3 });
+    _taskTreeProvider?.refresh();
+    if (!created.length) {
+        vscode.window.showInformationMessage('Agent OS verifier dispatch: 검증 대기 중인 READY_FOR_VERIFICATION 작업이 없거나 이미 verifier task가 있습니다.');
+        return [];
+    }
+    const message = `Agent OS verifier task ${created.length}건 생성 · ${created.map(item => item.assignee).join(', ')}`;
+    _activeChatProvider?.injectSystemMessage(`✅ ${message}`);
+    const action = await vscode.window.showInformationMessage(message, '큐 보기');
+    if (action === '큐 보기') {
+        _dashboardExtensionUri = _extCtx?.extensionUri || _dashboardExtensionUri;
+        if (_dashboardExtensionUri) CompanyDashboardPanel.createOrShow(_dashboardExtensionUri);
+    }
+    return created;
+}
+
+async function runAgentApplyVerificationCommand(seed?: { execute?: boolean; max?: number }): Promise<AgentQueueItem[]> {
+    const execute = typeof seed?.execute === 'boolean'
+        ? seed.execute
+        : (await vscode.window.showWarningMessage(
+            '검증자가 accept/reject/needs_human evidence를 남긴 READY_FOR_VERIFICATION 작업에만 적용합니다.',
+            { modal: false },
+            '적용',
+            'Dry-run'
+        )) === '적용';
+    const result = applyAgentVerificationEvidence({ execute, max: seed?.max || 20 });
+    _taskTreeProvider?.refresh();
+    if (!result.planned.length) {
+        vscode.window.showInformationMessage('Agent OS verifier apply: 적용 가능한 검증 evidence가 없습니다.');
+        return [];
+    }
+    const message = execute
+        ? `Agent OS verifier apply: ${result.applied.length}건 적용`
+        : `Agent OS verifier apply dry-run: ${result.planned.length}건 적용 가능`;
+    _activeChatProvider?.injectSystemMessage(`✅ ${message}\n\n${result.planned.map(plan => `${plan.sourceId} <- ${plan.verifierId}: ${plan.verdict} -> ${plan.targetStatus}`).join('\n')}`);
+    const action = await vscode.window.showInformationMessage(message, '큐 보기');
+    if (action === '큐 보기') {
+        _dashboardExtensionUri = _extCtx?.extensionUri || _dashboardExtensionUri;
+        if (_dashboardExtensionUri) CompanyDashboardPanel.createOrShow(_dashboardExtensionUri);
+    }
+    return result.applied;
+}
+
+function readAgentQueue(): AgentQueueItem[] {
+    try {
+        const p = _agentQueuePath();
+        if (!fs.existsSync(p)) return [];
+        const parsed = JSON.parse(fs.readFileSync(p, 'utf-8') || '[]');
+        if (!Array.isArray(parsed)) return [];
+        return parsed.map((item: any) => ({
+            id: _sanitizeQueueText(item.id || `aq-${Date.now()}`, 120),
+            title: _sanitizeQueueText(item.title || 'Untitled task', 160),
+            assignee: _coerceAgentQueueAssignee(item.assignee),
+            status: _coerceAgentQueueStatus(item.status),
+            priority: _coerceAgentQueuePriority(item.priority),
+            files: Array.isArray(item.files) ? item.files.map((f: unknown) => _sanitizeQueueText(f, 180)).filter(Boolean).slice(0, 12) : [],
+            prompt: _sanitizeQueueText(item.prompt || '', 6000),
+            resultSummary: _sanitizeQueueText(item.resultSummary || '', 2000),
+            createdAt: _sanitizeQueueText(item.createdAt || new Date().toISOString(), 40),
+            updatedAt: _sanitizeQueueText(item.updatedAt || item.createdAt || new Date().toISOString(), 40),
+            verifiedAt: item.verifiedAt ? _sanitizeQueueText(item.verifiedAt, 40) : undefined,
+            completedAt: item.completedAt ? _sanitizeQueueText(item.completedAt, 40) : undefined,
+            claimedBy: item.claimedBy ? _sanitizeQueueText(item.claimedBy, 120) : undefined,
+            claimedAt: item.claimedAt ? _sanitizeQueueText(item.claimedAt, 40) : undefined,
+            role: item.role ? _sanitizeQueueText(item.role, 40) : undefined,
+            workerClass: item.workerClass ? _sanitizeQueueText(item.workerClass, 40) : undefined,
+            riskClass: item.riskClass ? _sanitizeQueueText(item.riskClass, 20) : undefined,
+            risk: item.risk ? _sanitizeQueueText(item.risk, 20) : undefined,
+            allowedAssignees: Array.isArray(item.allowedAssignees) ? item.allowedAssignees.map((v: unknown) => _sanitizeQueueText(v, 40)).filter(Boolean).slice(0, 8) : undefined,
+            requiresHumanApproval: !!item.requiresHumanApproval,
+            writeScope: Array.isArray(item.writeScope) ? item.writeScope.map((v: unknown) => _sanitizeQueueText(v, 180)).filter(Boolean).slice(0, 12) : undefined,
+            forbiddenPaths: Array.isArray(item.forbiddenPaths) ? item.forbiddenPaths.map((v: unknown) => _sanitizeQueueText(v, 180)).filter(Boolean).slice(0, 12) : undefined,
+            executor: item.executor ? _sanitizeQueueText(item.executor, 40) : undefined,
+            reviewer: item.reviewer ? _sanitizeQueueText(item.reviewer, 120) : undefined,
+            intent: item.intent ? _sanitizeQueueText(item.intent, 120) : undefined,
+            expectedTests: Array.isArray(item.expectedTests) ? item.expectedTests.map((v: unknown) => _sanitizeQueueText(v, 240)).filter(Boolean).slice(0, 12) : undefined,
+            rollbackPath: item.rollbackPath ? _sanitizeQueueText(item.rollbackPath, 1000) : undefined,
+            stopCondition: item.stopCondition ? _sanitizeQueueText(item.stopCondition, 1000) : undefined,
+            approvalCondition: item.approvalCondition ? _sanitizeQueueText(item.approvalCondition, 1000) : undefined,
+            evidenceRequired: Array.isArray(item.evidenceRequired) ? item.evidenceRequired.map((v: unknown) => _sanitizeQueueText(v, 240)).filter(Boolean).slice(0, 12) : undefined,
+            tokenBudget: item.tokenBudget ? _sanitizeQueueText(item.tokenBudget, 80) : undefined,
+            retryBudget: Number.isFinite(Number(item.retryBudget)) ? Number(item.retryBudget) : undefined,
+            canWrite: typeof item.canWrite === 'boolean' ? item.canWrite : undefined,
+            agentOsStatus: item.agentOsStatus ? _sanitizeQueueText(item.agentOsStatus, 60) : undefined,
+        }));
+    } catch {
+        return [];
+    }
+}
+
+function readWorkerStatus(): Record<string, WorkerStatusItem> {
+    try {
+        const p = _phase3StoragePath('worker-status.json');
+        if (!fs.existsSync(p)) return {};
+        const parsed = JSON.parse(fs.readFileSync(p, 'utf-8') || '{}');
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+        const out: Record<string, WorkerStatusItem> = {};
+        for (const [agent, value] of Object.entries(parsed as Record<string, any>)) {
+            if (!value || typeof value !== 'object') continue;
+            out[_sanitizeQueueText(agent, 40)] = {
+                agent: _coerceAgentQueueAssignee(value.agent || agent),
+                workerClass: _sanitizeQueueText(value.workerClass || 'worker', 40),
+                label: _sanitizeQueueText(value.label || agent, 80),
+                status: _sanitizeQueueText(value.status || 'idle', 40),
+                phase: _sanitizeQueueText(value.phase || 'idle', 80),
+                message: _sanitizeQueueText(value.message || '', 240),
+                taskId: _sanitizeQueueText(value.taskId || '', 120),
+                taskTitle: _sanitizeQueueText(value.taskTitle || '', 160),
+                updatedAt: _sanitizeQueueText(value.updatedAt || '', 40),
+            };
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+function readWorkerHealth(): WorkerHealthPayload {
+    try {
+        const p = _phase3StoragePath('worker-health.json');
+        if (!fs.existsSync(p)) return {};
+        const parsed = JSON.parse(fs.readFileSync(p, 'utf-8') || '{}');
+        if (!parsed || typeof parsed !== 'object') return {};
+        const agents: WorkerHealthPayload['agents'] = {};
+        for (const [agent, value] of Object.entries((parsed as any).agents || {})) {
+            if (!value || typeof value !== 'object') continue;
+            agents[_sanitizeQueueText(agent, 40)] = {
+                agent: _sanitizeQueueText((value as any).agent || agent, 40),
+                workerClass: _sanitizeQueueText((value as any).workerClass || 'worker', 40),
+                status: _sanitizeQueueText((value as any).status || 'UNKNOWN', 40),
+                detail: _sanitizeQueueText((value as any).detail || '', 180),
+                latencyMs: Number((value as any).latencyMs) || 0,
+                updatedAt: _sanitizeQueueText((value as any).updatedAt || '', 40),
+            };
+        }
+        return { generatedAt: _sanitizeQueueText((parsed as any).generatedAt || '', 40), agents };
+    } catch {
+        return {};
+    }
+}
+
+function writeAgentQueue(items: AgentQueueItem[]): void {
+    const p = _agentQueuePath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const payload = JSON.stringify(items, null, 2) + '\n';
+    const tmp = `${p}.tmp-${process.pid}-${Date.now()}`;
+    const backup = `${p}.bak`;
+    try {
+        fs.writeFileSync(tmp, payload, 'utf-8');
+        try {
+            if (fs.existsSync(p)) fs.copyFileSync(p, backup);
+        } catch {
+            // Best-effort backup; queue write should still proceed if backup is unavailable.
+        }
+        fs.renameSync(tmp, p);
+        try {
+            fs.copyFileSync(p, backup);
+        } catch {
+            // Best-effort latest valid backup for the next recovery attempt.
+        }
+    } catch (error) {
+        try {
+            if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+        } catch {
+            // Ignore cleanup failures and surface the original write error.
+        }
+        throw error;
+    }
+}
+
+function updateAgentQueueStatus(id: string, status: AgentQueueStatus, resultSummary?: string): { ok: boolean; message: string } {
+    const items = readAgentQueue();
+    const item = items.find(q => q.id === id);
+    if (!item) return { ok: false, message: `작업을 찾지 못함: ${id}` };
+    item.status = status;
+    if (typeof resultSummary === 'string') {
+        item.resultSummary = _sanitizeQueueText(resultSummary, 2000);
+    }
+    item.updatedAt = new Date().toISOString();
+    writeAgentQueue(items);
+    return { ok: true, message: `작업 상태 변경: ${item.title} → ${status}` };
+}
+
+interface AgentRoleMetadata {
+  executor?: string;
+  status?: string;
+  primaryNotes?: string[];
+  allowedTools?: string[];
+  approvalTools?: string[];
+  forbiddenTools?: string[];
+  riskLevel?: string;
+  nextAction?: string;
+  uiBadges?: string[];
+}
+
+function _safeStringArray(value: any, limit = 12): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(v => typeof v === 'string')
+    .map(v => v.trim())
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function readAgentRoleMetadata(): Record<string, AgentRoleMetadata> {
+  try {
+    const root = _extCtx?.extensionUri?.fsPath || __dirname;
+    const p = path.join(root, 'config', 'agent-roles.json');
+    if (!fs.existsSync(p)) return {};
+    const data = JSON.parse(fs.readFileSync(p, 'utf-8') || '{}');
+    const agents = data && typeof data === 'object' && data.agents && typeof data.agents === 'object'
+      ? data.agents
+      : {};
+    const out: Record<string, AgentRoleMetadata> = {};
+    for (const id of AGENT_ORDER) {
+      const raw = agents[id];
+      if (!raw || typeof raw !== 'object') continue;
+      out[id] = {
+        executor: typeof raw.executor === 'string' ? raw.executor.trim().slice(0, 80) : '',
+        status: typeof raw.status === 'string' ? raw.status.trim().slice(0, 40) : '',
+        primaryNotes: _safeStringArray(raw.primaryNotes, 8),
+        allowedTools: _safeStringArray(raw.allowedTools, 16),
+        approvalTools: _safeStringArray(raw.approvalTools, 12),
+        forbiddenTools: _safeStringArray(raw.forbiddenTools, 12),
+        riskLevel: typeof raw.riskLevel === 'string' ? raw.riskLevel.trim().slice(0, 20) : '',
+        nextAction: typeof raw.nextAction === 'string' ? raw.nextAction.trim().slice(0, 180) : '',
+        uiBadges: _safeStringArray(raw.uiBadges, 8),
+      };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function checkAgentRoleToolAccess(agentId: string, toolName: string): { decision: 'allow' | 'approval' | 'forbidden'; reason?: string } {
+  const normalized = String(toolName || '').trim();
+  if (!normalized) return { decision: 'forbidden', reason: '도구 이름이 비어 있습니다.' };
+  const meta = readAgentRoleMetadata()[agentId] || {};
+  const has = (items?: string[]) => Array.isArray(items) && items.includes(normalized);
+  if (has(meta.forbiddenTools)) {
+    return { decision: 'forbidden', reason: `${agentId} 에이전트에 금지된 도구입니다: ${normalized}` };
+  }
+  if (has(meta.approvalTools)) {
+    return { decision: 'approval', reason: `${agentId} 에이전트는 이 도구 실행 전에 승인이 필요합니다: ${normalized}` };
+  }
+  return { decision: 'allow' };
+}
+
 function ensureCompanyStructure(): string {
   const dir = getCompanyDir();
   fs.mkdirSync(path.join(dir, '_shared'), { recursive: true });
@@ -5606,7 +7050,8 @@ function readAgentSharedContext(agentId: string, opts?: { lean?: boolean }): str
   const ragMode = readAgentRagMode(agentId);
   let ctx = '';
   // Priority order (most-trusted first):
-  //   agent goal > company goals > company identity > decisions > memory > brain knowledge > tools
+  //   permanent operating memory > agent goal > company goals > company identity > decisions > memory > brain knowledge > tools
+  ctx += readConnectAiPermanentOperatingMemory({ lean });
   if (personalGoal.trim()) ctx += `\n\n[당신의 개인 목표 (최우선 — 매 사이클 이 방향으로 한 스텝 진행)]\n${personalGoal.slice(0, 4000)}`;
   if (companyGoals.trim()) ctx += `\n\n[회사 공동 목표]\n${companyGoals.slice(0, 4000)}`;
   if (identity.trim()) ctx += `\n\n[회사 정체성]\n${identity.slice(0, 2000)}`;
@@ -5649,9 +7094,9 @@ function readAgentSharedContext(agentId: string, opts?: { lean?: boolean }): str
     const skillsBlock = readAgentSkills(agentId, lean ? 1500 : 4000);
     if (skillsBlock) ctx += skillsBlock;
   } catch { /* never break the prompt */ }
-  /* v2.89.115 — 템플릿 (재사용 빌딩블록). 두뇌의 40_템플릿/<id>/ 폴더.
-     스킬보다 더 무거운 자료(코드·파일·문서) — 매니페스트만 inject, 실제 파일은
-     LLM이 필요시 read_file 로 읽기. */
+  /* v2.89.115 — 템플릿 (재사용 빌딩블록). Agent OS에서는 company runtime의
+     templates/<id>/ 폴더가 표준 위치다. 기존 vault 40_템플릿은 read-only legacy
+     source로만 참조해 graph noise를 늘리지 않는다. */
   try {
     const templatesBlock = readAgentTemplates(agentId, lean ? 1000 : 2000);
     if (templatesBlock) ctx += templatesBlock;
@@ -5722,7 +7167,7 @@ function readAgentSharedContext(agentId: string, opts?: { lean?: boolean }): str
 function appendAgentMemory(agentId: string, line: string) {
   try {
     const p = path.join(getCompanyDir(), '_agents', agentId, 'memory.md');
-    const stamp = new Date().toISOString().slice(0, 10);
+    const stamp = kstDate();
     fs.appendFileSync(p, `\n- [${stamp}] ${line.replace(/\n/g, ' ').slice(0, 300)}`);
   } catch { /* ignore */ }
 }
@@ -5732,7 +7177,7 @@ function appendAgentMemory(agentId: string, line: string) {
    memory.md는 모든 활동을 그대로 누적하는 append-only 로그(firehose)이고,
    skills/는 사용자가 명시적으로 "이거 패턴화"라고 승격시킨 것만. 신뢰도가
    훨씬 높으므로 system prompt에 더 강한 라벨로 주입한다. */
-/* v2.89.115 — 번들 템플릿을 두뇌 폴더로 복사. 첫 호출 시 한 번 실행.
+/* v2.89.115 — 번들 템플릿을 runtime 템플릿 폴더로 복사. 첫 호출 시 한 번 실행.
    기존 폴더가 있으면 건드리지 않음 (사용자가 편집한 거 보호). */
 function _seedBundledTemplates(agentId: string, targetDir: string) {
   try {
@@ -5761,30 +7206,47 @@ function _copyDirRecursive(src: string, dst: string) {
   }
 }
 
-/* v2.89.115 — 템플릿 reader. 두뇌의 `40_템플릿/<agentId>/` 폴더 스캔.
+function getAgentTemplateRuntimeDir(agentId: string, templateName?: string): string {
+  const base = path.join(getCompanyDir(), 'templates', agentId);
+  return templateName ? path.join(base, templateName) : base;
+}
+
+function legacyBrainTemplateDirs(agentId: string): string[] {
+  const brainDir = _getBrainDir();
+  return [
+    path.join(brainDir, '40_템플릿', agentId),
+    path.join(brainDir, '40_Templates', agentId),
+  ];
+}
+
+/* v2.89.115 — 템플릿 reader. 표준 runtime `templates/<agentId>/` 폴더 스캔.
+   기존 vault `40_템플릿/<agentId>/`는 read-only legacy source로만 참조한다.
    각 템플릿은 하위 폴더이고 README.md + manifest.json + 코드 파일 가짐.
    AI 컨텍스트엔 매니페스트 요약 + README의 핵심 + 파일 목록만 inject (전체 코드는 X —
    파일 너무 크면 컨텍스트 폭주). LLM이 "이 템플릿 쓰겠다" 결정하면 read_file로 실제
    파일 읽으면 됨. */
 function readAgentTemplates(agentId: string, maxChars = 2000): string {
-  const brainDir = _getBrainDir();
-  /* 새 표준 위치: 두뇌 안의 40_템플릿/<agentId>/ */
-  const standardDir = path.join(brainDir, '40_템플릿', agentId);
-  const englishDir = path.join(brainDir, '40_Templates', agentId);
-  let templatesDir = '';
-  if (fs.existsSync(standardDir)) templatesDir = standardDir;
-  else if (fs.existsSync(englishDir)) templatesDir = englishDir;
-  else {
-    /* 첫 사용 — 번들 템플릿이 있으면 두뇌에 시드 */
-    _seedBundledTemplates(agentId, standardDir);
-    if (fs.existsSync(standardDir)) templatesDir = standardDir;
+  const runtimeDir = getAgentTemplateRuntimeDir(agentId);
+  if (!fs.existsSync(runtimeDir)) {
+    _seedBundledTemplates(agentId, runtimeDir);
   }
-  if (!templatesDir) return '';
-  let folders: string[] = [];
+  const templateDirs = [
+    ...(fs.existsSync(runtimeDir) ? [runtimeDir] : []),
+    ...legacyBrainTemplateDirs(agentId).filter(d => fs.existsSync(d)),
+  ];
+  if (templateDirs.length === 0) return '';
+  const folders: { name: string; dir: string }[] = [];
+  const seen = new Set<string>();
   try {
-    folders = fs.readdirSync(templatesDir, { withFileTypes: true })
-      .filter(e => e.isDirectory() && !e.name.startsWith('.') && !e.name.startsWith('_'))
-      .map(e => e.name);
+    for (const templatesDir of templateDirs) {
+      for (const e of fs.readdirSync(templatesDir, { withFileTypes: true })) {
+        if (!e.isDirectory() || e.name.startsWith('.') || e.name.startsWith('_')) continue;
+        const key = e.name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        folders.push({ name: e.name, dir: path.join(templatesDir, e.name) });
+      }
+    }
   } catch { return ''; }
   if (folders.length === 0) return '';
   /* v2.89.125 — 스케일링: 매니페스트 풀 inject 대신 압축 형식 (이름 + 한 줄).
@@ -5792,8 +7254,8 @@ function readAgentTemplates(agentId: string, maxChars = 2000): string {
      500자 이내 (10~20개 키트도 안전). */
   const MAX_KITS_LISTED = 20;
   const briefs: { name: string; title: string; desc: string; keywords: string[]; files: number }[] = [];
-  for (const name of folders.slice(0, MAX_KITS_LISTED)) {
-    const tplDir = path.join(templatesDir, name);
+  for (const entry of folders.slice(0, MAX_KITS_LISTED)) {
+    const { name, dir: tplDir } = entry;
     let manifest: any = null;
     try {
       const mp = path.join(tplDir, 'manifest.json');
@@ -5861,8 +7323,8 @@ function readAgentSkills(agentId: string, maxChars = 4000): string {
 function _getLastSpecialistOutput(): { agentId: string; agentName: string; body: string } | null {
   try {
     const convDir = getConversationsDir();
-    const today = new Date().toISOString().slice(0, 10);
-    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const today = kstDate();
+    const yesterday = kstDateDaysAgo(1);
     /* Index agent name → id for reverse lookup. Skip CEO (planner role,
        not a specialist whose patterns we'd reuse). */
     const nameToId = new Map<string, string>();
@@ -5988,7 +7450,7 @@ _사용자가 직접 줄을 지우면 그 주장은 다시 미검증 상태로 �
 `;
       fs.writeFileSync(p, header);
     }
-    const stamp = new Date().toISOString().slice(0, 10);
+    const stamp = kstDate();
     const oneLine = (claim || '').replace(/\n/g, ' ').slice(0, 360);
     const src = (source || '').replace(/\n/g, ' ').slice(0, 120);
     fs.appendFileSync(p, `\n- [${stamp}] ${oneLine} _(근거: ${src})_`);
@@ -6030,9 +7492,9 @@ function promoteGroundedClaimsFromOutput(agentId: string, output: string): numbe
 
 /* When the user injects a file into the brain (⚡ button), score it against
    each agent's specialty and append a memory line to the top matches. The
-   raw file lives at <brain>/00_Raw/<date>/<name>; agents now know "new
-   knowledge inbound" without us having to wait for them to scan the brain
-   folder on next cycle. Returns the agent IDs that received an entry. */
+   durable note must already have passed through memory-bridge/vault policy;
+   this function only reads the resulting note and routes a short notification.
+   Returns the agent IDs that received an entry. */
 function routeBrainInjectionToAgents(filePath: string, fileName: string): string[] {
   if (!isCompanyConfigured()) return [];
   let raw = '';
@@ -7251,27 +8713,25 @@ function _seedSecretaryGoogleCalendarWrite(toolsDir: string) {
   _seedFileForceUpgrade(path.join(toolsDir, 'google_calendar_write.md'), md, '비서가 본인의 Google Calendar와 양방향 연결');
 }
 
-/** Resolve the conversation log directory inside the user's brain folder.
- *  Lives at `<brain>/00_Raw/conversations/` so it joins the existing
- *  Second-Brain raw-knowledge convention — visible to the brain graph,
- *  synced by GitHub auto-sync, browsable in the user's note-taking app. */
+/** Resolve the conversation log directory inside the company runtime folder.
+ *  Runtime transcripts are operational evidence, not durable Obsidian notes. */
 function getConversationsDir(): string {
-  const brain = getCompanyDir(); // unified with brain folder
-  return path.join(brain, '00_Raw', 'conversations');
+  const company = getCompanyDir();
+  return path.join(company, 'conversations');
 }
 
 /** Append one entry to the day's running conversation log. Living transcript
  *  of every interaction in the company — user commands, CEO briefs, each
- *  agent's output, confer turns, final reports. Stored in 00_Raw alongside
- *  other raw knowledge so it participates in brain queries. */
+ *  agent's output, confer turns, final reports. Stored in runtime so it does
+ *  not create graph noise in the user's Obsidian vault. */
 function appendConversationLog(entry: { speaker: string; emoji?: string; section?: string; body: string }) {
   try {
     const convDir = getConversationsDir();
     fs.mkdirSync(convDir, { recursive: true });
-    const today = new Date().toISOString().slice(0, 10);
+    const today = kstDate();
     const dayFile = path.join(convDir, `${today}.md`);
     if (!fs.existsSync(dayFile)) {
-      fs.writeFileSync(dayFile, `# 📜 ${today} 회사 대화록\n\n_모든 명령·분배·산출물·대화가 시간순으로 누적됩니다. 두뇌가 자동 인덱싱·동기화합니다._\n`);
+      fs.writeFileSync(dayFile, `# 📜 ${today} 회사 런타임 대화록\n\n_모든 명령·분배·산출물·대화가 시간순으로 누적됩니다. Obsidian durable note가 아니라 runtime evidence입니다._\n`);
     }
     const ts = new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
     const emoji = entry.emoji || '🗨️';
@@ -7288,8 +8748,8 @@ function readRecentConversations(maxChars = 2500): string {
   try {
     const convDir = getConversationsDir();
     if (!fs.existsSync(convDir)) return '';
-    const today = new Date().toISOString().slice(0, 10);
-    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const today = kstDate();
+    const yesterday = kstDateDaysAgo(1);
     let combined = '';
     for (const day of [yesterday, today]) {
       const f = path.join(convDir, `${day}.md`);
@@ -7359,6 +8819,123 @@ function _isCasualChat(text: string): boolean {
     // Pure emoji/laughter
     if (/^[\sㅋㅎ.!?~ㅠㅜ😂🙂😊👍❤️]+$/u.test(t)) return true;
     return false;
+}
+
+function _buildFastMetaReply(text: string): string {
+    const t = (text || '').trim();
+    if (!t) return '';
+    const lower = t.toLowerCase();
+    const asksReadiness = /지금\s*(써도|사용해도|명령|작업\s*시켜도)|connect\s*chat.*(?:가능|써도)|readiness|ready|운영\s*준비|사용\s*가능|green\s*chat/i.test(t);
+    const asksAntigravity = /안티\s*그라비티|안티그라비티|antigravity|agy/.test(lower);
+    const asksIdentity = /누구|정체|뭐야|맞아|맞냐|사용|쓰고|모델|planner|플래너|분배|라우팅|영숙|비서/.test(t);
+    const asksOperatingSummary = /운영\s*구조|현재\s*구조|현재\s*운영|운영\s*기준|역할|요약|상태|확인|5\s*줄|다섯\s*줄/.test(t);
+    const explicitlyReadOnly = /구현\s*(작업)?\s*금지|수정\s*금지|실행\s*금지|파일\s*수정\s*금지|확인만|요약만|read-?only/i.test(t);
+    const asksQueueOrWorkerSmoke = /green|그린|큐|queue|worker|executor|하달|실행\s*경로|등록|claim|codex|claude|수행/.test(lower);
+    const hasWorkVerb = /구현|수정|만들|생성|삭제|실행|분석해|조사|등록|연결|테스트|검증해|돌려|큐|worker|작업\s*시켜/.test(t);
+    if (hasWorkVerb && !explicitlyReadOnly) return '';
+
+    if (asksReadiness && !asksQueueOrWorkerSmoke) {
+        return buildConnectAiReadinessSummary().text;
+    }
+
+    if (asksOperatingSummary && explicitlyReadOnly && !asksQueueOrWorkerSmoke) {
+        return [
+            '1. Connect AI의 작업 분배/CEO planner는 기본적으로 Antigravity CLI가 맡습니다.',
+            '2. 로컬 LLM은 안정화 전까지 기본 비활성화되어 있고, 짧은 fallback 용도로만 남깁니다.',
+            '3. Codex와 Claude는 동급 executor이고, 실제 구현/파일 작업/검증을 담당합니다.',
+            '4. Gemini와 Antigravity는 reviewer이며, Hermes는 승인자나 자율 운전자가 아닌 observer입니다.',
+            '5. Red/high-risk와 protected path 변경은 사용자만 승인할 수 있고, 완료는 실행 증거가 있어야 인정됩니다.',
+        ].join('\n');
+    }
+
+    if (asksAntigravity && asksIdentity) {
+        return [
+            '네. 지금 Connect AI의 작업 분배/CEO planner는 Antigravity CLI를 기본으로 쓰도록 설정되어 있어요.',
+            '',
+            '- 상단 `Planner: Antigravity`: 작업 분배/라우팅 담당',
+            '- 오른쪽 로컬 모델 드롭다운: 짧은 응답/fallback용 로컬 LLM',
+            '- Codex/Claude: 실행자',
+            '- Gemini/Antigravity: 리뷰어',
+            '- Hermes: 관찰자',
+        ].join('\n');
+    }
+
+    if (/영숙|비서/.test(t) && asksIdentity) {
+        return [
+            '네, 영숙은 Connect AI의 비서/Personal Assistant 역할이에요.',
+            '다만 간단한 확인 질문은 앞으로 작업 분배 파이프라인을 태우지 않고 바로 답하게 할게요.',
+        ].join('\n');
+    }
+
+    return '';
+}
+
+function _buildReadOnlyWorkerHandoffDiagnostic(text: string): string {
+    const t = (text || '').trim();
+    if (!t) return '';
+    const lower = t.toLowerCase();
+    const wantsWorkerCheck = /green|그린|worker|executor|codex|claude|큐|queue|하달|실행\s*경로|등록|claim|agent\s*queue|선택\s*executor|실제\s*worker/i.test(lower);
+    const explicitWorkerRunAllowed = /실제\s*worker\s*실행은?\s*(?:Codex|코덱스)?\s*\d*\s*회?만?\s*허용|worker\s*실행.*허용|Codex\s*\d+\s*회만?\s*허용|실제\s*수행|실제로\s*수행|수행해라|처리해라|end-to-end\s*경로를\s*검증/i.test(t);
+    const forbidsWorkerOrQueueMutation = /실제\s*worker\s*실행\s*금지|worker\s*실행\s*금지|큐\s*상태\s*변경\s*금지|상태\s*변경\s*금지|queue\s*mutation\s*금지|claim\s*금지|큐\s*등록\s*금지/i.test(t);
+    const diagnosticOnly = /점검만|보고해라|확인만|진단만|수행하지\s*마|실행하지\s*마|실행\s*금지|read-?only/i.test(t);
+    if (!wantsWorkerCheck || explicitWorkerRunAllowed || !(forbidsWorkerOrQueueMutation || diagnosticOnly)) return '';
+
+    const items = readAgentQueue();
+    const counts: Record<string, number> = {};
+    for (const item of items) counts[item.status] = (counts[item.status] || 0) + 1;
+
+    const workerStatus = readWorkerStatus();
+    const workerHealth = readWorkerHealth();
+    const agents = workerHealth.agents || {};
+    const codexHealth = (agents.codex?.status || workerStatus.codex?.status || 'UNKNOWN').toUpperCase();
+    const claudeHealth = (agents.claude?.status || workerStatus.claude?.status || 'UNKNOWN').toUpperCase();
+    const selectedExecutor = codexHealth === 'READY'
+        ? 'codex'
+        : (claudeHealth === 'READY' ? 'claude' : 'codex');
+    const selectedReason = codexHealth === 'READY'
+        ? 'Codex health가 READY라 Green executor 기본 후보'
+        : (claudeHealth === 'READY'
+            ? 'Codex READY 확인 불가, Claude health가 READY라 후보'
+            : '둘 다 READY 확인 불가라 기본 후보만 codex로 표시');
+
+    const activeItems = items
+        .filter(item => ['queued', 'copied', 'running', 'blocked'].includes(item.status))
+        .slice(0, 8)
+        .map(item => `- ${item.status} / ${item.assignee} / ${item.priority}: ${item.title} (${item.id})`);
+    const statusLines = Object.entries(workerStatus)
+        .slice(0, 8)
+        .map(([agent, value]) => `- ${agent}: ${value.status || 'unknown'} / ${value.phase || '-'}${value.taskTitle ? ` / ${value.taskTitle}` : ''}`);
+    const healthLines = Object.entries(agents)
+        .slice(0, 8)
+        .map(([agent, value]) => `- ${agent}: ${(value.status || 'UNKNOWN').toUpperCase()}${value.detail ? ` / ${value.detail}` : ''}`);
+
+    return [
+        '판정: read-only Green worker 하달 점검으로 처리했습니다.',
+        '수행한 것: 큐/worker 상태 파일 읽기만 수행.',
+        '수행하지 않은 것: 큐 등록, claim, worker 실행, session 생성, verified 승격, decisions 기록, 파일 편집.',
+        '',
+        `현재 큐 파일: ${_agentQueuePath()}`,
+        `현재 큐 상태: total ${items.length}, queued ${counts.queued || 0}, copied ${counts.copied || 0}, running ${counts.running || 0}, blocked ${counts.blocked || 0}, done ${counts.done || 0}`,
+        '',
+        `선택 executor(예상): ${selectedExecutor}`,
+        `선택 근거: ${selectedReason}`,
+        `Codex health/status: ${codexHealth}`,
+        `Claude health/status: ${claudeHealth}`,
+        '',
+        `예상 실행 명령(실행 안 함): npm run agent:run -- --execute --only ${selectedExecutor}`,
+        `예상 실행 경로: Connect AI chat -> agent queue 등록 -> npm run agent:run -> scripts/run-queue.js -> ${selectedExecutor}-worker`,
+        '',
+        'blocked 여부: YES. 이번 요청 자체가 "파일 수정/worker 실행/큐 상태 변경 금지"라 실제 하달은 blocked_by_prompt_constraints=true 입니다.',
+        '',
+        '활성 큐 샘플:',
+        activeItems.length ? activeItems.join('\n') : '- 활성 큐 항목 없음',
+        '',
+        'worker status:',
+        statusLines.length ? statusLines.join('\n') : '- worker-status.json 없음 또는 비어 있음',
+        '',
+        'worker health:',
+        healthLines.length ? healthLines.join('\n') : '- worker-health.json 없음 또는 비어 있음',
+    ].join('\n');
 }
 
 const CEO_REPORT_PROMPT = _loadPrompt('ceo-report.md');
@@ -7536,6 +9113,8 @@ ${a.specialty}${personaBlock}
   • <run_command>명령</run_command> — 셸 실행. 맥은 sh, 윈도우는 cmd.exe
   • <reveal_in_explorer path="..."/> — Finder/Explorer 열기 (사용자 시각 확인용)
   • <open_file path="..."/> — 기본 앱(이미지·PDF·웹페이지)으로 열기
+
+Obsidian vault에는 \`<create_file>\`/\`<edit_file>\`/\`<delete_file>\`로 직접 쓰지 마십시오. Obsidian vault에는 \`<run_command>\`로 직접 쓰거나 지우지 마십시오. 장기 노트는 brain-inject/memory-bridge 또는 vault-writer를 통해서만 작성하고, agent/runtime 산출물은 companyDir에만 둡니다.
 
 OS 차이: 백그라운드 프로세스는 맥/리눅스에선 \`nohup ... &\`, 윈도우에선 \`start /b ...\` (시스템이 \`run_command\`를 \`shell:true\`로 실행하므로 양쪽 모두 작동).
 
@@ -7848,10 +9427,13 @@ function _autoPickInstalledModelIfMissing() {
 }
 
 export function activate(context: vscode.ExtensionContext) {
+    envPolicyRedactor = createEnvPolicyRedactor(context.extensionUri.fsPath);
+    logDebug('🔥 Connect AI V2 활성화 완료!');
     vscode.window.showInformationMessage('🔥 Connect AI V2 활성화 완료!');
     console.log('Connect AI extension activated.');
 
     _extCtx = context;
+    registerOurDepartmentCommands(context, redactForDebug);
     /* v2.89.138 — extensionUri 즉시 세팅. 이전엔 "우리 회사 대시보드" 명령
        처음 열기 전엔 _dashboardExtensionUri=null 이라 ApiConnectionsPanel /
        RevenueDashboardPanel 가 _loadWebviewAsset() 으로 빈 CSS·JS 받음 →
@@ -7889,7 +9471,7 @@ export function activate(context: vscode.ExtensionContext) {
     try {
         const m = getCompanyMetrics();
         if (!m.foundedAt) {
-            const today = new Date().toISOString().slice(0, 10);
+            const today = kstDate();
             updateCompanyMetrics({ foundedAt: today });
             console.log('[Day counter] foundedAt stamped:', today);
         }
@@ -8237,33 +9819,25 @@ export function activate(context: vscode.ExtensionContext) {
                             brainDir = _getBrainDir();
                         }
 
-                        if (!fs.existsSync(brainDir)) {
-                            fs.mkdirSync(brainDir, { recursive: true });
-                        }
-
-                        // P-Reinforce 아키텍처 호환: 00_Raw 폴더 내 날짜별 분류
-                        const today = new Date();
-                        const dateStr = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
-                        const datePath = path.join(brainDir, '00_Raw', dateStr);
-
-                        // Path traversal 방어: datePath가 brainDir 안에 있는지 확인
-                        if (!datePath.startsWith(path.resolve(brainDir) + path.sep)) {
+                        const writeResult = writeBrainInjectNote(safeTitle, markdown);
+                        if (!writeResult.ok || !writeResult.wrote) {
                             res.writeHead(400, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify({ error: 'invalid path' }));
+                            res.end(JSON.stringify({
+                                error: 'brain-inject durable write rejected',
+                                reason: writeResult.reason || (writeResult.ok ? `write mode ${writeResult.mode} did not write` : 'unknown'),
+                                relPath: writeResult.relPath,
+                            }));
                             return;
                         }
-
-                        fs.mkdirSync(datePath, { recursive: true });
-                        const filePath = path.join(datePath, `${safeTitle}.md`);
-
-                        fs.writeFileSync(filePath, markdown, 'utf-8');
+                        const filePath = writeResult.path;
+                        const relPath = writeResult.relPath;
                         const metrics = getCompanyMetrics();
                         updateCompanyMetrics({ knowledgeInjected: (metrics.knowledgeInjected || 0) + 1 });
 
                         // 0a. 항상 보이는 사용자 신호 — sidebar가 닫혀있어도 이 토스트는 떠서
                         //     "주입됐다"는 사실을 즉시 인지 가능.
                         vscode.window.showInformationMessage(
-                            `🧠 새 지식 주입됨: ${safeTitle}.md (저장 위치: ${path.relative(brainDir, filePath)})`
+                            `🧠 새 지식 주입됨: ${safeTitle}.md (저장 위치: ${relPath})`
                         );
 
                         // 0b. 그래프 패널들에 새 데이터 broadcast — 새 노드가 즉시
@@ -8273,7 +9847,6 @@ export function activate(context: vscode.ExtensionContext) {
                         // 1. 채팅창에 화려한 inject 카드 + history 영구 저장 — 사이드바가
                         //    닫혀있어도 다음에 열면 breadcrumb으로 남고, 열려있으면 곧장
                         //    애니메이션 카드가 등장합니다.
-                        const relPath = path.relative(brainDir, filePath);
                         provider.broadcastInjectCard(safeTitle, relPath);
 
                         // 2. AI 입을 빌려 네오의 명대사를 치게 함
@@ -8285,7 +9858,7 @@ export function activate(context: vscode.ExtensionContext) {
                         _safeGitAutoSync(brainDir, `Auto-Inject Knowledge [Raw]: ${safeTitle}`, provider);
 
                         res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ success: true, filePath }));
+                        res.end(JSON.stringify({ success: true, filePath, relPath }));
                     } catch (e: any) {
                         const status = e.message === 'BODY_TOO_LARGE' ? 413 : 500;
                         res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -8323,15 +9896,8 @@ export function activate(context: vscode.ExtensionContext) {
                             res.end(JSON.stringify({ error: 'name, script 필드가 유효하지 않습니다.' }));
                             return;
                         }
-                        // 2) 회사 폴더 보장
-                        if (!_isBrainDirExplicitlySet()) {
-                            const ensured = await _ensureBrainDir();
-                            if (!ensured) {
-                                res.writeHead(400, { 'Content-Type': 'application/json' });
-                                res.end(JSON.stringify({ error: '두뇌 폴더를 먼저 선택해주세요.' }));
-                                return;
-                            }
-                        }
+                        // 2) 회사 runtime 폴더 보장. 스킬팩은 durable Obsidian note가 아니라
+                        // agent runtime asset이므로 brain/vault 초기화에 묶지 않는다.
                         ensureCompanyStructure();
                         const toolsDir = path.join(getCompanyDir(), '_agents', agentId, 'tools');
                         if (!toolsDir.startsWith(path.resolve(getCompanyDir()) + path.sep)) {
@@ -8368,8 +9934,8 @@ export function activate(context: vscode.ExtensionContext) {
                         setTimeout(() => {
                             provider.sendPromptFromExtension(`[A.U 히든 커맨드: ${agentLabel} 에이전트가 방금 '${displayName || safeName}' 스킬팩을 주입받았습니다. 매트릭스에서 새 스킬을 다운로드받은 네오처럼 쿨하게 딱 한마디만 하십시오. "${agentLabel}, ${displayName || safeName} 스킬 장착 완료. 다음 사이클부터 사용 가능." 부가 설명 없이 한 줄로.]`);
                         }, 1500);
-                        // 5) GitHub 자동 백업 (브레인 폴더 = 회사 폴더 통합 구조)
-                        _safeGitAutoSync(_getBrainDir(), `Auto-Inject Skill [${agentId}]: ${safeName}`, provider);
+                        // 5) 회사 runtime 백업. Vault git sync를 건드리지 않는다.
+                        _safeGitAutoSyncCompany(`Auto-Inject Skill [${agentId}]: ${safeName}`, provider);
                         res.writeHead(200, { 'Content-Type': 'application/json' });
                         res.end(JSON.stringify({ success: true, scriptPath, agent: agentId, name: safeName }));
                     } catch (e: any) {
@@ -8381,7 +9947,7 @@ export function activate(context: vscode.ExtensionContext) {
             }
             else if (req.method === 'POST' && req.url === '/api/template-inject') {
                 /* v2.89.120 — 템플릿 팩 주입. EZER 등 외부 도구가 코드 boilerplate
-                   묶음을 주면 두뇌의 40_템플릿/<agentId>/<name>/ 로 폴더 구조로 저장.
+                   묶음을 주면 company runtime templates/<agentId>/<name>/ 로 폴더 구조로 저장.
                    코다리 같은 에이전트가 다음 작업에 자동 참조.
                    payload: { agent, name, manifest, readme, files: {filename: content} } */
                 (async () => {
@@ -8408,17 +9974,9 @@ export function activate(context: vscode.ExtensionContext) {
                             res.end(JSON.stringify({ error: 'name 필드가 유효하지 않습니다.' }));
                             return;
                         }
-                        if (!_isBrainDirExplicitlySet()) {
-                            const ensured = await _ensureBrainDir();
-                            if (!ensured) {
-                                res.writeHead(400, { 'Content-Type': 'application/json' });
-                                res.end(JSON.stringify({ error: '두뇌 폴더를 먼저 선택해주세요.' }));
-                                return;
-                            }
-                        }
-                        const brainDir = _getBrainDir();
-                        const tplRoot = path.join(brainDir, '40_템플릿', agentId, safeName);
-                        if (!tplRoot.startsWith(path.resolve(brainDir) + path.sep)) {
+                        ensureCompanyStructure();
+                        const tplRoot = getAgentTemplateRuntimeDir(agentId, safeName);
+                        if (!tplRoot.startsWith(path.resolve(getCompanyDir()) + path.sep)) {
                             res.writeHead(400, { 'Content-Type': 'application/json' });
                             res.end(JSON.stringify({ error: 'invalid path' }));
                             return;
@@ -8459,7 +10017,7 @@ export function activate(context: vscode.ExtensionContext) {
                         setTimeout(() => {
                             provider.sendPromptFromExtension(`[A.U 히든 커맨드: ${agentLabel} 에이전트가 방금 '${displayName || safeName}' 템플릿 팩 주입받았습니다. 코드 boilerplate ${writtenCount}개 파일 + README. 매트릭스 톤으로 한 줄. "${agentLabel}, ${displayName || safeName} 템플릿 ${writtenCount}개 파일 장착. 다음 작업에 자동 활용." 부가 설명 X.]`);
                         }, 1500);
-                        _safeGitAutoSync(_getBrainDir(), `Auto-Inject Template [${agentId}]: ${safeName}`, provider);
+                        _safeGitAutoSyncCompany(`Auto-Inject Template [${agentId}]: ${safeName}`, provider);
                         res.writeHead(200, { 'Content-Type': 'application/json' });
                         res.end(JSON.stringify({ success: true, location: tplRoot, agent: agentId, name: safeName, filesWritten: writtenCount }));
                     } catch (e: any) {
@@ -8600,6 +10158,37 @@ export function activate(context: vscode.ExtensionContext) {
     dashStatusBar.show();
     context.subscriptions.push(dashStatusBar);
 
+    const readinessStatusBar = vscode.window.createStatusBarItem(
+        vscode.StatusBarAlignment.Left, 98
+    );
+    readinessStatusBar.command = 'connectAiLab.readiness.show';
+    const refreshReadinessBadge = () => {
+        try {
+            const summary = buildConnectAiReadinessSummary();
+            if (summary.verdict === 'READY') {
+                readinessStatusBar.text = '$(check) Connect AI READY';
+                readinessStatusBar.backgroundColor = undefined;
+            } else if (summary.verdict === 'LIMITED_READY' || summary.verdict === 'BUSY_BUT_USABLE') {
+                readinessStatusBar.text = `$(warning) Connect AI ${summary.verdict}`;
+                readinessStatusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+            } else {
+                readinessStatusBar.text = `$(error) Connect AI ${summary.verdict}`;
+                readinessStatusBar.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+            }
+            readinessStatusBar.tooltip = `${summary.reason}\n\n${summary.text}`;
+            readinessStatusBar.show();
+        } catch {
+            readinessStatusBar.text = '$(question) Connect AI 상태 확인';
+            readinessStatusBar.tooltip = 'Connect AI 운영 준비 상태를 확인합니다.';
+            readinessStatusBar.backgroundColor = undefined;
+            readinessStatusBar.show();
+        }
+    };
+    refreshReadinessBadge();
+    context.subscriptions.push(readinessStatusBar);
+    const readinessTimer = setInterval(refreshReadinessBadge, 15000);
+    context.subscriptions.push({ dispose: () => clearInterval(readinessTimer) });
+
     // Live count of pending approvals in a second status bar item — only
     // visible when count > 0 so it functions as an attention magnet, not
     // permanent chrome. Updates via the same onTrackerChanged + a poll.
@@ -8642,6 +10231,41 @@ export function activate(context: vscode.ExtensionContext) {
                 /* v2.89.14 — 진단: 대시보드 패널 생성 실패 시 사용자에게 안내. */
                 vscode.window.showErrorMessage(`👥 직원 에이전트 보기 열기 실패: ${e?.message || e}. (Cmd+Shift+P → "Developer: Reload Window" 시도)`);
                 console.error('[dashboard.open] failed:', e);
+            }
+        }),
+        vscode.commands.registerCommand('connectAiLab.readiness.show', async () => {
+            const summary = buildConnectAiReadinessSummary();
+            const action = await vscode.window.showInformationMessage(
+                `Connect AI: ${summary.verdict} · Green chat ${summary.usableForGreenChat ? 'YES' : 'NO'}`,
+                '채팅에 표시',
+                '대시보드 열기'
+            );
+            if (action === '채팅에 표시') {
+                _activeChatProvider?.injectSystemMessage(`🧭 Connect AI 운영 준비 상태\n\n${summary.text}`);
+            } else if (action === '대시보드 열기') {
+                _dashboardExtensionUri = context.extensionUri;
+                CompanyDashboardPanel.createOrShow(context.extensionUri);
+            }
+        }),
+        vscode.commands.registerCommand('connectAiLab.agent.dispatchGoal', async (seed?: AgentDispatchCommandInput) => {
+            try {
+                await runAgentDispatchGoalCommand(seed);
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`Agent OS dispatch 실패: ${e?.message || e}`);
+            }
+        }),
+        vscode.commands.registerCommand('connectAiLab.agent.dispatchVerification', async (seed?: { reviewer?: AgentVerificationReviewer | 'auto'; max?: number }) => {
+            try {
+                await runAgentDispatchVerificationCommand(seed);
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`Agent OS verifier dispatch 실패: ${e?.message || e}`);
+            }
+        }),
+        vscode.commands.registerCommand('connectAiLab.agent.applyVerification', async (seed?: { execute?: boolean; max?: number }) => {
+            try {
+                await runAgentApplyVerificationCommand(seed);
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`Agent OS verifier apply 실패: ${e?.message || e}`);
             }
         }),
         vscode.commands.registerCommand('connectAiLab.apiConnections.open', () => {
@@ -9054,10 +10678,12 @@ async function runChangeCompanyDir() {
     const cur = (cfg.get<string>('companyDir', '') || '').trim();
     const oldDir = getCompanyDir();
     const brainDir = _getBrainDir();
-    const isNested = !cur || _resolvePathInput(cur) === path.join(brainDir, COMPANY_SUBDIR);
+    const resolvedCur = _resolvePathInput(cur);
+    const isNested = !!resolvedCur && resolvedCur === path.join(brainDir, COMPANY_SUBDIR);
+    const currentLabel = (resolvedCur || oldDir).replace(os.homedir(), '~');
     const stateLine = isNested
         ? `현재: 📂 두뇌 안 nested (\`${path.join(brainDir, COMPANY_SUBDIR).replace(os.homedir(), '~')}\`)`
-        : `현재: 📂 별도 위치 (\`${cur.replace(os.homedir(), '~')}\`)`;
+        : `현재: 📂 런타임/별도 위치 (\`${currentLabel}\`)`;
 
     const picked = await vscode.window.showQuickPick(
         [
@@ -9072,7 +10698,7 @@ async function runChangeCompanyDir() {
     let newDir = '';
     if (picked.value === 'nest') {
         newDir = path.join(brainDir, COMPANY_SUBDIR);
-        await cfg.update('companyDir', '', vscode.ConfigurationTarget.Global);
+        await cfg.update('companyDir', newDir, vscode.ConfigurationTarget.Global);
     } else {
         const folder = await vscode.window.showOpenDialog({
             canSelectFolders: true, canSelectFiles: false, canSelectMany: false,
@@ -10747,6 +12373,21 @@ class CompanyDashboardPanel {
                     } catch (e: any) {
                         this._panel.webview.postMessage({ type: 'revenueMini', data: { error: e?.message || String(e) } });
                     }
+                } else if (msg?.type === 'copyAgentQueuePrompt' && typeof msg.id === 'string') {
+                    const item = readAgentQueue().find(q => q.id === String(msg.id));
+                    if (!item) {
+                        this._postToast('⚠️ 큐 작업을 찾지 못했습니다.', true);
+                    } else {
+                        await vscode.env.clipboard.writeText(item.prompt || '');
+                        const r = updateAgentQueueStatus(item.id, 'copied');
+                        this._postToast(r.ok ? `📋 프롬프트 복사됨: ${item.title}` : r.message, !r.ok);
+                        await this._sendState();
+                    }
+                } else if (msg?.type === 'updateAgentQueueStatus' && typeof msg.id === 'string') {
+                    const status = _coerceAgentQueueStatus(msg.status);
+                    const r = updateAgentQueueStatus(String(msg.id), status, typeof msg.resultSummary === 'string' ? msg.resultSummary : undefined);
+                    this._postToast(r.message, !r.ok);
+                    await this._sendState();
                 } else if (msg?.type === 'setAgentActive' && msg.agent) {
                     /* v2.89.107 — 활성/비활성 토글. PIN 안 받음 (Luna는 별도 hireAgent). */
                     const aid = String(msg.agent || '').trim();
@@ -10833,6 +12474,9 @@ class CompanyDashboardPanel {
                 } else if (msg?.type === 'fireBriefing') {
                     await _runDailyBriefingOnce(true);
                     this._postToast('🌅 데일리 브리핑 발사 완료');
+                } else if (msg?.type === 'diagnoseConnection') {
+                    await vscode.commands.executeCommand('connectAiLab.diagnoseConnection');
+                    this._postToast('🔍 LLM 연결 진단 실행');
                 } else if (msg?.type === 'getAgentModelRouting') {
                     /* v2.89.26 — 모델 라우팅 모달 데이터 송출. 설치된 모델 + 현재 매핑 */
                     try {
@@ -10986,6 +12630,15 @@ class CompanyDashboardPanel {
                         if (!tool) {
                             this._panel.webview.postMessage({ type: 'skillRunOutput', ok: false, output: `⚠️ 스킬 못 찾음: ${msg.skillName}` });
                         } else {
+                            const access = checkAgentRoleToolAccess(msg.agentId, tool.name);
+                            if (access.decision === 'forbidden') {
+                                this._panel.webview.postMessage({ type: 'skillRunOutput', ok: false, output: `⛔ 정책 게이트 차단\n${access.reason}` });
+                                return;
+                            }
+                            if (access.decision === 'approval') {
+                                this._panel.webview.postMessage({ type: 'skillRunOutput', ok: false, output: `🟡 승인 필요\n${access.reason}\n\n아직 승인 큐 자동 연결 전이라 실행하지 않았습니다.` });
+                                return;
+                            }
                             const scriptPath = tool.scriptPath;
                             const cwd = path.dirname(scriptPath);
                             const cmd = `${_pythonCmd()} ${JSON.stringify(path.basename(scriptPath))}`;
@@ -11110,7 +12763,7 @@ class CompanyDashboardPanel {
 
         const conversationsToday = (() => {
             try {
-                const today = new Date().toISOString().slice(0, 10);
+                const today = kstDate();
                 const txt = _safeReadText(path.join(getConversationsDir(), `${today}.md`));
                 return txt.split('\n').filter(l => l.startsWith('## [')).length;
             } catch { return 0; }
@@ -11125,9 +12778,11 @@ class CompanyDashboardPanel {
            profile photo when available (영숙/레오). The photo URI is resolved
            through the panel's webview so the asset is reachable from the
            sandboxed iframe. */
+        const agentRoleMetadata = readAgentRoleMetadata();
         const agentTeam = AGENT_ORDER.map(id => {
             const a = AGENTS[id];
             if (!a) return null;
+            const roleMeta = agentRoleMetadata[id] || {};
             const myTasks = openTasks.filter(t => Array.isArray(t.agentIds) && t.agentIds.includes(id));
             let lastActivity = '';
             try {
@@ -11250,6 +12905,7 @@ class CompanyDashboardPanel {
                 togglable: isAgentTogglable(id),
                 alwaysOn: ALWAYS_ON_AGENTS.has(id),
                 optional: OPTIONAL_AGENTS_DEFAULT.has(id),
+                roleMeta,
             };
         }).filter(Boolean);
         const totalAgents = agentTeam.length;
@@ -11263,6 +12919,12 @@ class CompanyDashboardPanel {
                 oauthConnected,
                 yt,
                 agentTeam,
+                agentQueue: readAgentQueue(),
+                agentQueuePath: _agentQueuePath(),
+                workerStatus: readWorkerStatus(),
+                workerHealth: readWorkerHealth(),
+                workerStatusPath: _phase3StoragePath('worker-status.json'),
+                workerHealthPath: _phase3StoragePath('worker-health.json'),
                 hiredCount,
                 totalAgents,
                 activeCount,
@@ -11422,7 +13084,32 @@ class CompanyDashboardPanel {
       <span class="tl-chip" data-filter="optional" title="OPT-IN 비활성 — 카드 클릭해서 활성화"><span class="tl-dot tl-dot-opt"></span>옵션 <span class="tl-count" id="tlOpt">0</span></span>
       <span class="tl-chip" data-filter="locked" title="채용 PIN 필요"><span class="tl-dot tl-dot-lock"></span>채용 대기 <span class="tl-count" id="tlLock">0</span></span>
     </div>
+    <div class="team-ops-status" title="config/agent-roles.json 기반 역할/노트/도구 권한 표시 및 민감 MCP 도구 일부 정책 게이트 적용">
+      <span class="team-ops-label">운영 권한 연결됨</span>
+      <span class="team-ops-copy">카드를 클릭하면 담당 노트, executor, 허용/승인/금지 도구가 보입니다.</span>
+      <span class="team-ops-mode">partial-mcp-gated</span>
+    </div>
     <div class="team-grid" id="teamBody"></div>
+  </section>
+
+  <section class="card span-12 team-room-card" id="teamRoomCard">
+    <div class="card-head">
+      <div class="card-title"><span class="title-icon">🎛️</span> Team Room · 실행 세션 현황</div>
+      <span class="badge" id="teamRoomBadge">0 active</span>
+    </div>
+    <div class="team-room-stage" id="teamRoomStage"></div>
+  </section>
+
+  <section class="card span-12 agent-manager-card" id="agentManagerCard">
+    <div class="card-head">
+      <div class="card-title"><span class="title-icon">🧭</span> Agent Manager · 작업 분배 큐</div>
+      <span class="badge" id="agentQueueBadge">0 queued</span>
+    </div>
+    <div class="agent-manager-note">
+      코드 기반 큐가 Codex/Claude 실행자와 Gemini/Antigravity 리뷰어에게 작업을 보냅니다. Hermes는 관찰자이며, Red 작업은 사람 승인 없이는 닫히지 않습니다.
+    </div>
+    <div class="agent-queue-filters" id="agentQueueFilters"></div>
+    <div class="agent-queue-grid" id="agentQueueBody"></div>
   </section>
 
   <!-- v2.89.142 — 매출 카드. 회사 대시보드 메인 진입점.
@@ -12582,6 +14269,7 @@ class OfficePanel {
 
         panel.onDidDispose(() => this.dispose(), null, this._disposables);
         panel.webview.onDidReceiveMessage(async (msg) => {
+            logWebviewMessage('OfficePanel Message', msg);
             switch (msg.type) {
                 case 'officeReady':
                     this._sendInit();
@@ -12662,7 +14350,7 @@ class OfficePanel {
                 case 'loadConversations': {
                     try {
                         const convDir = getConversationsDir();
-                        const today = new Date().toISOString().slice(0, 10);
+                        const today = kstDate();
                         const f = path.join(convDir, `${today}.md`);
                         const content = fs.existsSync(f) ? fs.readFileSync(f, 'utf-8') : `_아직 오늘 대화가 없습니다._\n\n경로: ${convDir.replace(os.homedir(), '~')}/${today}.md`;
                         panel.webview.postMessage({ type: 'conversationsLoaded', date: today, content });
@@ -15882,7 +17570,7 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
             // 사용자가 24시간 업무를 OFF 했으면 자동 브리핑도 같이 OFF.
             const enabled = vscode.workspace.getConfiguration('connectAiLab').get<boolean>('autoCycleEnabled', true);
             if (!enabled) return;
-            const today = new Date().toISOString().slice(0, 10);
+            const today = kstDate();
             const last = ctx.globalState.get<string>('lastMorningBriefDate', '');
             if (last === today) return;
             await ctx.globalState.update('lastMorningBriefDate', today);
@@ -16003,7 +17691,7 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
         if (!enabled) return;
         const model = this.getDefaultModel();
         if (!model) return;
-        const today = new Date().toISOString().slice(0, 10);
+        const today = kstDate();
         /* v2.89 — 큐에 자율 사이클 작업 추가. 워커가 알아서 처리하고, 사용자
            명령이 들어오면 그게 우선. 자율 사이클이 진행 중일 때 다음 사이클
            들어오면 큐에 같은 키로 이미 있어서 중복 추가 안 됨(=정상). */
@@ -16664,6 +18352,24 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
     public sendPromptFromExtension(prompt: string, opts?: { fromTelegram?: boolean; corporate?: boolean }) {
         const fromTelegram = !!opts?.fromTelegram;
         const corporate = !!opts?.corporate;
+        const agentShortcut = parseAgentDispatchShortcut(prompt);
+        if (agentShortcut) {
+            try {
+                const item = createAgentDispatchQueueItem(agentShortcut);
+                _taskTreeProvider?.refresh();
+                const reply = formatAgentDispatchShortcutResponse(item);
+                this._displayMessages.push({ text: prompt, role: 'user' });
+                this._displayMessages.push({ text: reply, role: 'ai' });
+                try { this.postSystemNote?.(reply, '🧭'); } catch { /* ignore */ }
+                if (fromTelegram) sendTelegramReport(reply).catch(() => {});
+                this._saveHistory();
+            } catch (e: any) {
+                const err = `Agent OS dispatch 실패: ${e?.message || e}`;
+                try { this.postSystemNote?.(err, '⚠️'); } catch { /* ignore */ }
+                if (fromTelegram) sendTelegramReport(`⚠️ ${err}`).catch(() => {});
+            }
+            return;
+        }
         if (fromTelegram) {
             this._telegramMirrorPending = true;
             // Snapshot AI message count so the mirror watcher can detect the
@@ -16847,6 +18553,7 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
                             type: 'agentDockData',
                             installed: installedWithMem,
                             defaultModel,
+                            plannerProvider: getConfig().plannerProvider,
                             agents,
                             specs,
                         });
@@ -16907,12 +18614,32 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
                     break;
                 }
                 case 'prompt': {
-                    /* v2.89.146 — 명시적 호출 감지("현빈아", "코다리야" 등) 시 corporate
-                       모드 force. 사용자가 사이드바 toggle 안 해도 명시적 호출은 항상
-                       specialist dispatch 흐름으로 → 매출/키트 shortcut 발동. */
+                    /* v2.89.158 — Connect AI chat is now the default command
+                       router. The old default sent ordinary prompts to the
+                       single local LLM path, so the UI looked like Connect AI
+                       while behavior was still "selected qwen/ollama answers".
+                       Route sidebar prompts through the corporate dispatcher
+                       unless a future UI explicitly marks the message as local
+                       chat. */
                     const txt = String(msg.value || '');
+                    const agentShortcut = parseAgentDispatchShortcut(txt);
+                    if (agentShortcut) {
+                        try {
+                            const item = createAgentDispatchQueueItem(agentShortcut);
+                            _taskTreeProvider?.refresh();
+                            const reply = formatAgentDispatchShortcutResponse(item);
+                            this._displayMessages.push({ text: txt, role: 'user' });
+                            this._displayMessages.push({ text: reply, role: 'ai' });
+                            webviewView.webview.postMessage({ type: 'response', value: reply });
+                            this._saveHistory();
+                        } catch (e: any) {
+                            webviewView.webview.postMessage({ type: 'error', value: `Agent OS dispatch 실패: ${e?.message || e}` });
+                        }
+                        break;
+                    }
                     const hasExplicit = !!this._detectExplicitMention(txt);
-                    if (msg.corporate || hasExplicit) {
+                    const localChat = !!msg.localChat;
+                    if (!localChat || msg.corporate || hasExplicit) {
                         this._sidebarCorpModeOn = true;
                         await this._handleCorporatePrompt(txt, msg.model);
                     } else {
@@ -17028,6 +18755,15 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
                     const tool = tools.find(t => t.name === msg.tool);
                     if (!tool) {
                         webviewView.webview.postMessage({ type: 'toolRunCompleted', agent: msg.agent, tool: msg.tool, ok: false, reason: 'not_found', message: `도구를 찾을 수 없어요: ${msg.tool}` });
+                        break;
+                    }
+                    const access = checkAgentRoleToolAccess(String(msg.agent || ''), tool.name);
+                    if (access.decision === 'forbidden') {
+                        webviewView.webview.postMessage({ type: 'toolRunCompleted', agent: msg.agent, tool: msg.tool, ok: false, reason: 'policy_forbidden', message: `정책 게이트 차단: ${access.reason}` });
+                        break;
+                    }
+                    if (access.decision === 'approval') {
+                        webviewView.webview.postMessage({ type: 'toolRunCompleted', agent: msg.agent, tool: msg.tool, ok: false, reason: 'policy_approval_required', message: `승인 필요: ${access.reason}\n아직 승인 큐 자동 연결 전이라 실행하지 않았습니다.` });
                         break;
                     }
                     // Pre-flight: warn if any password field is empty. Frontend
@@ -17864,21 +19600,11 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
             brainDir = _getBrainDir();
         }
         
-        if (!fs.existsSync(brainDir)) {
-            fs.mkdirSync(brainDir, { recursive: true });
-        }
-        const today = new Date();
-        const dateStr = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
-        const datePath = path.join(brainDir, '00_Raw', dateStr);
-        
-        if (!fs.existsSync(datePath)) {
-            fs.mkdirSync(datePath, { recursive: true });
-        }
-
         let injectedTitles: string[] = [];
+        const injectedNotes: Array<{ title: string; relPath: string; path: string; content: string }> = [];
         const routedAgents = new Set<string>();
 
-        this._view.webview.postMessage({ type: 'response', value: `🧠 **[P-Reinforce 연동 준비]**\n첨부하신 ${files.length}개의 파일을 로컬 두뇌(\`00_Raw/${dateStr}\`)에 입수하고 자동 푸시를 진행합니다.` });
+        this._view.webview.postMessage({ type: 'response', value: `🧠 **[P-Reinforce 연동 준비]**\n첨부하신 ${files.length}개의 파일을 단일 작성자 경로(\`references/brain-injects/\`)로 입수하고 자동 푸시를 진행합니다.` });
 
         for (const file of files) {
             try {
@@ -17887,15 +19613,18 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
                 const sanitized = file.name.replace(/[^a-zA-Z0-9가-힣_.-]/gi, '_');
                 const safeTitle = safeBasename(sanitized);
                 if (!safeTitle) continue;
-                const filePath = safeResolveInside(datePath, safeTitle);
-                if (!filePath) continue; // path traversal blocked
-                fs.writeFileSync(filePath, fileContent, 'utf-8');
-                injectedTitles.push(safeTitle);
+                const writeResult = writeLocalBrainAttachmentNote(safeTitle, fileContent);
+                if (!writeResult.ok || !writeResult.wrote) {
+                    console.error('Failed to write brain file through memory-bridge:', writeResult.reason || writeResult.relPath);
+                    continue;
+                }
+                injectedTitles.push(writeResult.relPath);
+                injectedNotes.push({ title: safeTitle, relPath: writeResult.relPath, path: writeResult.path, content: fileContent });
                 /* Route a one-line summary into matching agents' memory.md
                    so on next cycle they already see "new knowledge inbound"
                    even before scanning the brain folder themselves. Best-effort. */
                 try {
-                    const recipients = routeBrainInjectionToAgents(filePath, safeTitle);
+                    const recipients = routeBrainInjectionToAgents(writeResult.path, safeTitle);
                     for (const id of recipients) routedAgents.add(id);
                 } catch (e) {
                     console.error('Failed to route inject to agent memory:', e);
@@ -17920,14 +19649,11 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
             
         setTimeout(() => {
             let combinedContent = '';
-            for (const title of injectedTitles) {
-                try {
-                    const content = fs.readFileSync(path.join(datePath, title), 'utf-8');
-                    combinedContent += `\n\n[원본 데이터: ${title}]\n\`\`\`\n${content.slice(0, 10000)}\n\`\`\``;
-                } catch(e) {}
+            for (const note of injectedNotes) {
+                combinedContent += `\n\n[원본 데이터: ${note.relPath}]\n\`\`\`\n${note.content.slice(0, 10000)}\n\`\`\``;
             }
 
-            const hiddenPrompt = `[A.U 시스템 지시: P-Reinforce Architect 모드 활성화]\n새로운 비정형 데이터('${safeTitles}')가 글로벌 두뇌(Second Brain)에 입수 및 클라우드 백업 처리 완료되었습니다.\n\n방금 입수된 데이터의 원본 내용은 아래와 같습니다:${combinedContent}\n\n여기서부터 중요합니다! 마스터가 '응'이나 '진행해' 등으로 동의할 경우, 당신은 절대 대화만으로 대답하지 말고 아래의 [P-Reinforce 구조화 규격]에 따라 곧바로 <create_file> Tool들을 사용하십시오.\n\n[P-Reinforce 구조화 규격]\n1. 폴더 생성: 원본 데이터를 주제별로 쪼개어 절대 경로인 \`${brainDir}/10_Wiki/\` 하위의 적절한 폴더(예: 🛠️ Projects, 💡 Topics, ⚖️ Decisions, 🚀 Skills)에 저장하십시오.\n2. 마크다운 양식 준수: 생성되는 각 문서 파일은 반드시 아래 포맷을 따라야 합니다.\n---\nid: {{UUID}}\ncategory: "[[10_Wiki/설정한_폴더]]"\nconfidence_score: 0.9\ntags: [관련태그]\nlast_reinforced: ${dateStr}\n---\n# [[문서 제목]]\n## 📌 한 줄 통찰\n> (핵심 요약)\n## 📖 구조화된 지식\n- (세부 내용 불렛 포인트)\n## 🔗 지식 연결\n- Parent: [[상위_카테고리]]\n- Related: [[연관_개념]]\n- Raw Source: [[00_Raw/${dateStr}/${safeTitles}]]\n\n지시를 숙지했다면 묻지 말고 즉각 \`<create_file path="${brainDir}/10_Wiki/새폴더/새문서.md">\`를 사용하여 지식을 분해 후 생성하십시오. 완료 후 잘라낸 결과를 보고하십시오.`;
+            const hiddenPrompt = `[A.U 시스템 지시: P-Reinforce Architect 모드 활성화]\n새로운 비정형 데이터('${safeTitles}')가 글로벌 두뇌(Second Brain)에 단일 작성자 정책을 통해 입수 및 클라우드 백업 처리되었습니다.\n\n방금 입수된 데이터의 원본 내용은 아래와 같습니다:${combinedContent}\n\n중요한 운영 제약:\n- Obsidian vault에는 직접 <create_file> 또는 임의 경로 쓰기를 하지 마십시오.\n- 구조화 결과는 먼저 대화 안에서 초안으로 제시하고, 실제 durable note 저장은 Connect AI brain-inject/memory-bridge 경로를 통해서만 진행하십시오.\n- 초안에는 type/status/tags/related, 관련 MOC 링크, 출처 references/brain-injects/ 경로를 명시하십시오.\n\n[P-Reinforce 구조화 초안 규격]\n# [[문서 제목]]\n## 한 줄 통찰\n> (핵심 요약)\n## 구조화된 지식\n- (세부 내용 불렛 포인트)\n## 연결 계획\n- Parent: [[00_MOC/AI Agent OS]] 또는 적절한 MOC\n- Related: [[연관_개념]]\n- Source: ${safeTitles}\n\n지시를 숙지했다면 파일을 직접 만들지 말고, 위 규격으로 구조화 초안을 제시한 뒤 READY_FOR_VERIFICATION 상태로 보고하십시오.`;
             this._chatHistory.push({ role: 'system', content: hiddenPrompt });
             
             const uiMsg = "🧠 데이터가 완벽하게 입수되었습니다! 즉시 P-Reinforce 구조화를 시작할까요?";
@@ -17971,9 +19697,9 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
             } else if (!models.includes(defaultModel)) {
                 models.unshift(defaultModel);
             }
-            this._view.webview.postMessage({ type: 'modelsList', value: models });
+            this._view.webview.postMessage({ type: 'modelsList', value: models, plannerProvider: getConfig().plannerProvider, plannerHealth: readPlannerHealthForUi() });
         } catch {
-            this._view.webview.postMessage({ type: 'modelsList', value: [defaultModel] });
+            this._view.webview.postMessage({ type: 'modelsList', value: [defaultModel], plannerProvider: getConfig().plannerProvider, plannerHealth: readPlannerHealthForUi() });
         }
     }
 
@@ -18656,6 +20382,27 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
                 };
             }
 
+            if (!getConfig().localLlmEnabled) {
+                const systemText = String(reqMessages[0]?.content || this._systemPrompt);
+                const userText = String(reqMessages[reqMessages.length - 1]?.content || userContent);
+                this._view.webview.postMessage({ type: 'streamStart' });
+                let aiMessage = await _callAntigravityCli(systemText, userText, { label: 'sidebar-with-files' });
+                this._view.webview.postMessage({ type: 'streamChunk', value: aiMessage });
+                this._view.webview.postMessage({ type: 'streamEnd' });
+                this._chatHistory.push({ role: 'assistant', content: aiMessage });
+                const report = await this._executeActions(aiMessage);
+                if (report.length > 0) {
+                    const reportMsg = `\n\n---\n**에이전트 작업 결과**\n${report.join('\n')}`;
+                    this._view.webview.postMessage({ type: 'streamChunk', value: reportMsg });
+                    this._view.webview.postMessage({ type: 'streamEnd' });
+                    aiMessage += reportMsg;
+                }
+                this._displayMessages.push({ text: this._stripActionTags(aiMessage), role: 'ai' });
+                this._pruneHistory();
+                this._saveHistory();
+                return;
+            }
+
             // Build image payload for vision models
             const images = imageFiles.map(f => f.data); // already base64
 
@@ -18843,6 +20590,27 @@ class SidebarChatProvider implements vscode.WebviewViewProvider {
                     role: 'system',
                     content: `${this._systemPrompt}${this._getProjectMemory()}\n\n[BACKGROUND CONTEXT - DO NOT EXPLAIN THIS TO THE USER UNLESS ASKED]\n${contextBlock}\n${workspaceCtx}\n${brainCtx}${internetCtx}`
                 };
+            }
+
+            if (!getConfig().localLlmEnabled) {
+                const systemText = String(reqMessages[0]?.content || this._systemPrompt);
+                const userText = String(reqMessages[reqMessages.length - 1]?.content || prompt);
+                this._view.webview.postMessage({ type: 'streamStart' });
+                let aiMessage = await _callAntigravityCli(systemText, userText, { label: 'sidebar-chat' });
+                this._view.webview.postMessage({ type: 'streamChunk', value: aiMessage });
+                this._view.webview.postMessage({ type: 'streamEnd' });
+                this._chatHistory.push({ role: 'assistant', content: aiMessage });
+                const report = await this._executeActions(aiMessage);
+                if (report.length > 0) {
+                    const reportMsg = `\n\n---\n**에이전트 작업 결과**\n${report.join('\n')}`;
+                    this._view.webview.postMessage({ type: 'streamChunk', value: reportMsg });
+                    this._view.webview.postMessage({ type: 'streamEnd' });
+                    aiMessage += reportMsg;
+                }
+                this._displayMessages.push({ text: this._stripActionTags(aiMessage), role: 'ai' });
+                this._pruneHistory();
+                this._saveHistory();
+                return;
             }
 
             let isLMStudio = _isLMStudioEngine(ollamaBase);
@@ -19434,14 +21202,35 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
         this._abortController = new AbortController();
         const isAborted = () => !!this._abortController?.signal.aborted;
         try {
-            ensureCompanyStructure();
-            const sessionDir = makeSessionDir();
-            const sessionDisplay = sessionDir.replace(os.homedir(), '~');
-
             this._displayMessages.push({ text: prompt, role: 'user' });
 
-            // Phase 1: log the user command at the top of every session
+            const workerHandoffDiagnostic = _buildReadOnlyWorkerHandoffDiagnostic(prompt);
+            if (workerHandoffDiagnostic) {
+                const wrapped = `🧪 Worker 하달 점검\n\n${workerHandoffDiagnostic}`;
+                this._displayMessages.push({ text: wrapped, role: 'ai' });
+                post({ type: 'response', value: wrapped });
+                return;
+            }
+
+            ensureCompanyStructure();
+
+            const fastMetaReply = _buildFastMetaReply(prompt);
+            if (fastMetaReply) {
+                const wrapped = `📱 영숙: ${fastMetaReply}`;
+                this._displayMessages.push({ text: wrapped, role: 'ai' });
+                post({ type: 'response', value: wrapped });
+                appendConversationLog({ speaker: '영숙', emoji: '📱', section: '빠른 확인 응답', body: fastMetaReply });
+                this._saveHistory();
+                try { await this._maybeMirrorToTelegram(); } catch { /* ignore */ }
+                return;
+            }
+
+            // Phase 1: log the user command at the top of every persisted work session.
+            // Read-only diagnostics above intentionally skip this to avoid vault/session writes.
             appendConversationLog({ speaker: '사용자', emoji: '👤', body: prompt });
+
+            const sessionDir = makeSessionDir();
+            const sessionDisplay = sessionDir.replace(os.homedir(), '~');
 
             // Bridge mode 'full' — Secretary is the single front door. Triage
             // the message: either Secretary handles it directly (greeting,
@@ -19595,7 +21384,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                 }
                 ceoStage = 'readAgentSharedContext';
                 let shared = '';
-                try { shared = readAgentSharedContext('ceo'); }
+                try { shared = readAgentSharedContext('ceo', { lean: true }); }
                 catch (sc: any) {
                     /* 두뇌 RAG 등이 폭주해도 CEO 호출은 계속 — 컨텍스트 일부 누락한 채 진행. */
                     console.error('[Connect AI] readAgentSharedContext 실패, 빈 컨텍스트로 계속:', sc?.message || sc);
@@ -19653,14 +21442,22 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                             ]
                         });
                     } else {
-                        planRaw = await this._callAgentLLM(
-                            ceoSystemPrompt,
-                            `[사용자 명령]\n${prompt}`,
-                            modelName,
-                            'ceo',
-                            false,
-                            { jsonMode: true }
-                        );
+                        const plannerProvider = getConfig().plannerProvider;
+                        if (plannerProvider === 'antigravity') {
+                            planRaw = await _callAntigravityPlanner(
+                                ceoSystemPrompt,
+                                `[사용자 명령]\n${prompt}`
+                            );
+                        } else {
+                            planRaw = await this._callAgentLLM(
+                                ceoSystemPrompt,
+                                `[사용자 명령]\n${prompt}`,
+                                modelName,
+                                'ceo',
+                                false,
+                                { jsonMode: true }
+                            );
+                        }
                     }
                 }
             } catch (e: any) {
@@ -19718,18 +21515,34 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                 /* (a) HTML/XML 잡음 제거 — `="num">2026</span>` 같은 토크나이저 사고. */
                 const cleaned = raw.replace(/<\/?[a-zA-Z][^>]*>/g, '').replace(/="[a-zA-Z0-9_-]+">/g, '');
                 /* (b) balanced extractor */
-                const obj = _extractFirstJsonObject(cleaned);
+                const candidates = _extractJsonObjects(cleaned);
+                const obj = candidates.find(candidate => candidate && Array.isArray(candidate.tasks) && candidate.tasks.length > 0)
+                    || candidates.find(candidate => candidate && typeof candidate.brief === 'string')
+                    || _extractFirstJsonObject(cleaned);
                 if (obj && Array.isArray(obj.tasks) && obj.tasks.length > 0) {
                     return { brief: String(obj.brief || ''), tasks: obj.tasks };
                 }
                 /* (c) 잘린 JSON 복구 — agent/task 쌍을 직접 추출 */
                 const tasks: { agent: string; task: string }[] = [];
-                const re = /"agent"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"\s*,\s*"task"\s*:\s*"((?:[^"\\]|\\.)*?)(?:"|$)/g;
-                let mm: RegExpExecArray | null;
-                while ((mm = re.exec(cleaned))) {
-                    const agent = mm[1].trim();
-                    const task = mm[2].replace(/\\n/g, '\n').replace(/\\"/g, '"').trim();
+                const recoverTask = (snippet: string) => {
+                    const agentM = snippet.match(/"agent"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/);
+                    const taskM = snippet.match(/"task"\s*:\s*"((?:[^"\\]|\\.)*?)(?:"|$)/);
+                    const agent = (agentM?.[1] || '').trim();
+                    const task = (taskM?.[1] || '').replace(/\\n/g, '\n').replace(/\\"/g, '"').trim();
                     if (agent && task) tasks.push({ agent, task });
+                };
+                const objectRe = /\{[^{}]*(?:"agent"|"task")[^{}]*(?:"agent"|"task")[^{}]*\}/g;
+                let mm: RegExpExecArray | null;
+                while ((mm = objectRe.exec(cleaned))) {
+                    recoverTask(mm[0]);
+                }
+                if (tasks.length === 0) {
+                    const re = /"agent"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"\s*,\s*"task"\s*:\s*"((?:[^"\\]|\\.)*?)(?:"|$)/g;
+                    while ((mm = re.exec(cleaned))) {
+                        const agent = mm[1].trim();
+                        const task = mm[2].replace(/\\n/g, '\n').replace(/\\"/g, '"').trim();
+                        if (agent && task) tasks.push({ agent, task });
+                    }
                 }
                 if (tasks.length > 0) {
                     const briefM = cleaned.match(/"brief"\s*:\s*"((?:[^"\\]|\\.)*?)(?:"|$)/);
@@ -19744,14 +21557,17 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
             if (!plan) {
                 try { _activeChatProvider?.postSystemNote?.('CEO 첫 응답 파싱 실패 — JSON 모드로 1회 재시도', '🔄'); } catch { /* ignore */ }
                 try {
-                    const retryRaw = await this._callAgentLLM(
-                        `${_personalizePrompt(CEO_PLANNER_PROMPT)}\n\n[중요] 오직 JSON 한 객체만 출력. 설명/주석/마크다운 금지. 형식: {"brief":"…","tasks":[{"agent":"<id>","task":"…"}]}`,
-                        `[사용자 명령]\n${prompt}`,
-                        modelName,
-                        'ceo',
-                        false,
-                        { jsonMode: true }
-                    );
+                    const retrySystem = `${_personalizePrompt(CEO_PLANNER_PROMPT)}\n\n[중요] 오직 JSON 한 객체만 출력. 설명/주석/마크다운 금지. 형식: {"brief":"…","tasks":[{"agent":"<id>","task":"…"}]}`;
+                    const retryRaw = getConfig().plannerProvider === 'antigravity'
+                        ? await _callAntigravityPlanner(retrySystem, `[사용자 명령]\n${prompt}`)
+                        : await this._callAgentLLM(
+                            retrySystem,
+                            `[사용자 명령]\n${prompt}`,
+                            modelName,
+                            'ceo',
+                            false,
+                            { jsonMode: true }
+                        );
                     plan = _parsePlan(retryRaw);
                     if (plan) planRaw = retryRaw;
                 } catch { /* fall through to error */ }
@@ -20581,7 +22397,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                     if (!fs.existsSync(decPath)) {
                         fs.writeFileSync(decPath, `# 📌 회사 의사결정 로그\n\n_자가학습이 자동 누적합니다. 잘못된 항목은 직접 삭제하세요._\n`);
                     }
-                    const ts = new Date().toISOString().slice(0, 10);
+                    const ts = kstDate();
                     const block = `\n## [${ts}] ${prompt.slice(0, 60)}\n${learnedDecisions.map(d => `- ${d}`).join('\n')}\n_세션: ${path.basename(sessionDir)}_\n`;
                     fs.appendFileSync(decPath, block);
                 } catch { /* ignore */ }
@@ -20681,7 +22497,19 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
         broadcast: boolean,
         opts?: { jsonMode?: boolean; onFirstToken?: () => void }
     ): Promise<string> {
-        const { ollamaBase, defaultModel, timeout } = getConfig();
+        const cfg = getConfig();
+        if (!cfg.localLlmEnabled) {
+            try { opts?.onFirstToken?.(); } catch { /* ignore */ }
+            const out = await _callAntigravityCli(systemPrompt, userMsg, {
+                jsonMode: opts?.jsonMode,
+                label: `${agentId} agent`,
+            });
+            if (broadcast && out) {
+                this._broadcastCorporate({ type: 'agentChunk', agent: agentId, value: out });
+            }
+            return out;
+        }
+        const { ollamaBase, defaultModel, timeout } = cfg;
         /* v2.89.26 — 에이전트별 모델 override. 사용자가 외부 연결 패널에서
            특정 에이전트에 다른 모델 할당했으면 그걸 사용. 없으면 기존 로직대로. */
         const overrideModel = getAgentModel(agentId, '');
@@ -21200,6 +23028,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
             }
             const absPath = resolved.abs;
             try {
+                assertAgentFileToolNotVaultWrite(absPath, 'create_file');
                 const dir = path.dirname(absPath);
                 if (!fs.existsSync(dir)) {
                     fs.mkdirSync(dir, { recursive: true });
@@ -21211,7 +23040,9 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                 this._trackFileAction(opts?.agentId, absPath, existed ? 'edit' : 'create');
                 if (!firstCreatedFile) { firstCreatedFile = absPath; }
             } catch (err: any) {
-                report.push(`❌ 생성 실패: ${relPath} — ${err.message}`);
+                const message = err?.message || String(err);
+                const verb = message.includes('direct Obsidian vault writes are forbidden') ? '생성 차단' : '생성 실패';
+                report.push(`❌ ${verb}: ${relPath} — ${message}`);
             }
         }
 
@@ -21238,6 +23069,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
             const absPath = resolved.abs;
 
             try {
+                assertAgentFileToolNotVaultWrite(absPath, 'edit_file');
                 let fileContent = fs.readFileSync(absPath, 'utf-8');
                 /* v2.89.104 — 편집 전 원본 보관 → diff 표시용 */
                 const originalContent = fileContent;
@@ -21315,10 +23147,13 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                     }
                 }
             } catch (err: any) {
-                if (err.code === 'ENOENT') {
+                const message = err?.message || String(err);
+                if (message.includes('direct Obsidian vault writes are forbidden')) {
+                    report.push(`❌ 편집 차단: ${relPath} — ${message}`);
+                } else if (err.code === 'ENOENT') {
                     report.push(`❌ 편집 실패: ${relPath} — 파일이 존재하지 않습니다.`);
                 } else {
-                    report.push(`❌ 편집 실패: ${relPath} — ${err.message}`);
+                    report.push(`❌ 편집 실패: ${relPath} — ${message}`);
                 }
             }
         }
@@ -21343,6 +23178,7 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                 continue;
             }
             try {
+                assertAgentFileToolNotVaultWrite(absPath, 'delete_file');
                 if (fs.existsSync(absPath)) {
                     const stat = fs.statSync(absPath);
                     if (stat.isDirectory()) {
@@ -21357,7 +23193,9 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                     report.push(`⚠️ 삭제 스킵: ${relPath} — 파일이 존재하지 않습니다.`);
                 }
             } catch (err: any) {
-                report.push(`❌ 삭제 실패: ${relPath} — ${err.message}`);
+                const message = err?.message || String(err);
+                const verb = message.includes('direct Obsidian vault writes are forbidden') ? '삭제 차단' : '삭제 실패';
+                report.push(`❌ ${verb}: ${relPath} — ${message}`);
             }
         }
 
@@ -21654,13 +23492,16 @@ ${catalog.map((c, i) => `${i + 1}. agent=${c.agentId} tool=${c.tool} — ${c.des
                         continue;
                     }
                     try {
+                        assertAgentFileToolNotVaultWrite(absPath, 'fallback_create_file');
                         const dir = path.dirname(absPath);
                         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
                         fs.writeFileSync(absPath, content, 'utf-8');
                         report.push(`✅ 생성(자동감지): ${relPath}`);
                         if (!firstCreatedFile) firstCreatedFile = absPath;
                     } catch (err: any) {
-                        report.push(`❌ 생성 실패: ${relPath} — ${err.message}`);
+                        const message = err?.message || String(err);
+                        const verb = message.includes('direct Obsidian vault writes are forbidden') ? '생성 차단' : '생성 실패';
+                        report.push(`❌ ${verb}: ${relPath} — ${message}`);
                     }
                 }
             }

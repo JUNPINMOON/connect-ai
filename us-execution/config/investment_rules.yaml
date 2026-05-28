@@ -1,0 +1,134 @@
+# Investment Rules Configuration
+strategy:
+  name: "US Momentum Reversal"
+  version: "1.0.0"
+  description: "미국 주식 모멘텀 반전 전략"
+
+# Entry Rules
+entry:
+  # 기술적 진입 조건
+  technical:
+    - condition: "RSI_oversold"
+      description: "RSI가 30 이하일 때"
+      threshold: 30
+      indicator: "RSI"
+      
+    - condition: "MACD_bullish_cross"
+      description: "MACD가 시그널선을 상향 돌파"
+      indicator: "MACD"
+      
+    - condition: "Volume_spike"
+      description: "거래량이 평균의 1.5배 이상"
+      threshold: 1.5
+      indicator: "Volume"
+      
+    - condition: "Price_above_MA20"
+      description: "가격이 20일 이동평균선 위"
+      indicator: "MA20"
+  
+  # 기본적 진입 조건
+  fundamental:
+    - condition: "Market_cap_minimum"
+      description: "시가총액 10억 달러 이상"
+      threshold: 1000000000
+      
+    - condition: "Positive_earnings_growth"
+      description: "전년 대비 이익 성장"
+      threshold: 0.1
+      
+    - condition: "ROE_minimum"
+      description: "ROE 10% 이상"
+      threshold: 0.1
+
+# Exit Rules
+exit:
+  # 익절 조건
+  profit:
+    - condition: "Target_profit"
+      description: "수익률 15% 달성"
+      threshold: 0.15
+      
+    - condition: "RSI_overbought"
+      description: "RSI가 70 이상"
+      threshold: 70
+      
+    - condition: "MACD_bearish_cross"
+      description: "MACD가 시그널선을 하향 돌파"
+  
+  # 손절 조건
+  loss:
+    - condition: "Fixed_stop_loss"
+      description: "고점 대비 5% 하락"
+      threshold: 0.05
+      
+    - condition: "Trailing_stop"
+      description: "최고가 대비 8% 하락"
+      threshold: 0.08
+      
+    - condition: "Support_break"
+      description: "주요 지지선 이탈"
+
+# Position Management
+position_management:
+  max_positions: 10
+  position_size_percent: 10
+  max_sector_exposure: 30
+  max_single_position: 50
+  
+  # 리밸런싱 규칙
+  rebalancing:
+    frequency: "weekly"
+    threshold: 0.2
+    
+# Risk Management
+risk_management:
+  # 포트폴리오 레벨 리스크
+  portfolio:
+    max_drawdown: 0.25
+    var_confidence: 0.95
+    beta_limit: 1.5
+    
+  # 포지션 레벨 리스크
+  position:
+    max_loss_per_trade: 0.02
+    max_correlation: 0.7
+    
+# Universe Selection
+universe:
+  included_sectors:
+    - "Technology"
+    - "Healthcare"
+    - "Finance"
+    - "Consumer Discretionary"
+    - "Industrial"
+    
+  excluded_sectors:
+    - "Energy"
+    - "Utilities"
+    - "Real Estate"
+    
+  liquidity_filters:
+    min_avg_volume: 1000000
+    min_price: 10
+    max_price: 500
+
+# Market Conditions
+market_conditions:
+  # 변동성 필터
+  volatility:
+    max_vix_level: 35
+    min_market_regime: "normal"
+    
+  # 시장 레짐
+  regimes:
+    bull_market:
+      position_multiplier: 1.2
+      take_profit_multiplier: 1.1
+      
+    bear_market:
+      position_multiplier: 0.8
+      stop_loss_multiplier: 0.8
+      
+    sideways_market:
+      position_multiplier: 1.0
+      take_profit_multiplier: 0.9

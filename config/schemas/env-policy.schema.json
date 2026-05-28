@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "env-policy",
+  "type": "object",
+  "required": ["version", "mutable", "global", "handling"],
+  "properties": {
+    "version": { "type": "integer" },
+    "description": { "type": "string" },
+    "mutable": { "const": false },
+    "threeLayerProtection": { "type": "object" },
+    "appliesTo": { "type": "array", "items": { "type": "string" } },
+    "matching": { "type": "object" },
+    "handling": {
+      "type": "object",
+      "required": ["default", "onViolation"],
+      "properties": {
+        "default": { "const": "deny" },
+        "onViolation": { "type": "string" },
+        "maskedRepresentation": { "type": "string" }
+      }
+    },
+    "global": {
+      "type": "object",
+      "required": ["readableAllow", "forbiddenNameWords", "forbiddenPrint", "forbiddenFiles"],
+      "properties": {
+        "readableAllow": { "type": "array", "items": { "type": "string" } },
+        "conditionalAllow": { "type": "object" },
+        "forbiddenNameWords": { "type": "array", "items": { "type": "string" } },
+        "forbiddenPrint": { "type": "array", "items": { "type": "string" } },
+        "forbiddenFiles": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "departments": { "type": "object" },
+    "notes": { "type": "string" }
+  },
+  "additionalProperties": false
+}

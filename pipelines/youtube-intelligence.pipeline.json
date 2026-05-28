@@ -1,0 +1,78 @@
+{
+  "department": "youtube-intelligence",
+  "root": "C:\\openclaw\\projects\\youtube-analysis",
+  "risk": "low",
+  "artifactsDir": "artifacts/youtube-intelligence/{runId}",
+  "_note": "Example stage pipeline. Demonstrates: narrow stages, artifact handoff, AI for subjective steps, fresh reviewer, doc-over-API, auto-most/gate-publish. Claude (brain) draft; Codex implements runner.",
+  "stages": [
+    {
+      "id": "ingest",
+      "name": "트랜스크립트/메타 수집",
+      "worker": "local",
+      "inputs": ["videoUrl"],
+      "output": "transcript.json",
+      "risk": "low",
+      "trust": "auto",
+      "runbook": "runbooks/youtube/ingest.md",
+      "tools": ["everything-search (로컬 캐시 확인)"]
+    },
+    {
+      "id": "analyze",
+      "name": "주제·구간·훅 추출",
+      "worker": "codex",
+      "inputs": ["transcript.json"],
+      "output": "analysis.json",
+      "risk": "low",
+      "runbook": "runbooks/youtube/analyze.md"
+    },
+    {
+      "id": "ideate",
+      "name": "콘텐츠 앵글·제목 브레인스토밍",
+      "worker": "claude-worker",
+      "_why": "주관·창작 판단 → AI가 의외로 잘하는 영역. 규칙 코딩 대신 그냥 시킴.",
+      "inputs": ["analysis.json"],
+      "output": "ideas.md",
+      "risk": "medium",
+      "runbook": "runbooks/youtube/ideate.md",
+      "review": { "reviewer": "local", "rules": "review-rules/ideate.md" }
+    },
+    {
+      "id": "draft-script",
+      "name": "대본 초안",
+      "worker": "claude-worker",
+      "inputs": ["ideas.md", "analysis.json"],
+      "output": "script.md",
+      "risk": "medium",
+      "runbook": "runbooks/youtube/script.md"
+    },
+    {
+      "id": "review",
+      "name": "fresh 검토 (문맥0 에이전트)",
+      "worker": "local",
+      "_why": "작업한 에이전트 말고 새 에이전트가 규칙으로 검증 = 실수 더 잘 잡음.",
+      "inputs": ["script.md"],
+      "output": "review.json",
+      "risk": "low",
+      "rules": "review-rules/script.md"
+    },
+    {
+      "id": "thumbnail-brief",
+      "name": "썸네일 브리프 작성(이미지 제작 지시문)",
+      "worker": "claude-worker",
+      "inputs": ["ideas.md"],
+      "output": "thumbnail-brief.md",
+      "risk": "low",
+      "runbook": "runbooks/youtube/thumbnail.md"
+    },
+    {
+      "id": "publish",
+      "name": "업로드/게시",
+      "worker": "human",
+      "_why": "외부 전송·게시 → 항상 사람 승인(APPROVAL). 자동 금지.",
+      "inputs": ["script.md", "thumbnail-brief.md"],
+      "output": "publish-receipt.json",
+      "risk": "high",
+      "gate": "APPROVAL (Telegram)"
+    }
+  ]
+}

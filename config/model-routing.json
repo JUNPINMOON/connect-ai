@@ -1,0 +1,56 @@
+{
+  "routing_rules": [
+    {
+      "task_type": "analysis",
+      "risk": "low",
+      "model": "z-ai/glm-4.6",
+      "provider": "openrouter"
+    },
+    {
+      "task_type": "analysis",
+      "risk": "medium",
+      "model": "z-ai/glm-4.6",
+      "provider": "openrouter"
+    },
+    {
+      "task_type": "implementation",
+      "risk": "low",
+      "model": "codex",
+      "provider": "delegate"
+    },
+    {
+      "task_type": "implementation",
+      "risk": "medium",
+      "model": "codex",
+      "provider": "delegate"
+    },
+    {
+      "task_type": "implementation",
+      "risk": "high",
+      "model": "claude-sonnet-4",
+      "provider": "bedrock"
+    },
+    {
+      "task_type": "sensitive",
+      "risk": "high",
+      "model": "local",
+      "provider": "local"
+    },
+    {
+      "task_type": "creative",
+      "risk": "low",
+      "model": "claude-sonnet-4",
+      "provider": "bedrock"
+    },
+    {
+      "task_type": "creative",
+      "risk": "medium",
+      "model": "claude-sonnet-4",
+      "provider": "bedrock"
+    }
+  ],
+  "fallback_model": {
+    "provider": "openrouter",
+    "model": "z-ai/glm-4.6"
+  }
+}

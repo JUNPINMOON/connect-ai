@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "description": "Model routing policy. Pairs with runtime-policy.json. Goal: with local LLM optional, cost/quota is the new bottleneck (not VRAM). Route cheap by default, expensive only when needed.",
+  "mutable": false,
+  "defaultBrainTier": "cloud-frontier",
+  "tiers": {
+    "route-classify": {
+      "use": "task routing, classification, short summaries",
+      "prefer": ["cheap-cloud", "local-8b"],
+      "reason": "high volume, low difficulty -> cheapest path"
+    },
+    "work-hard": {
+      "use": "deep coding, multi-file edits, reasoning-heavy",
+      "prefer": ["cloud-frontier (Claude Code / Codex)"],
+      "reason": "quality matters; spend here"
+    },
+    "bulk-context": {
+      "use": "large-context research, doc digestion",
+      "prefer": ["gemini-cli"],
+      "reason": "large context window, cheaper bulk"
+    },
+    "local-optional": {
+      "use": "offline / private / cheap classification",
+      "model": "qwen2.5-coder:7b (Ollama @127.0.0.1:11434)",
+      "constraint": "<=8b only (8GB VRAM). One model at a time. NOT for parallel sub-agents.",
+      "default": "off (cloud-first); enable per task"
+    }
+  },
+  "guardrails": {
+    "maxConcurrentWorkers": 3,
+    "approvalForExpensiveRun": true,
+    "note": "Hermes orchestrator must not fan out unbounded paid calls. run() approval gate (adapter interface) applies."
+  },
+  "notes": "Designed by Claude (brain). Codex wires routing into Hermes config + adapter layer. Tune maxConcurrentWorkers to your API quotas."
+}

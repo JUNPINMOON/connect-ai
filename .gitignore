@@ -7,3 +7,12 @@ preview.html
 releases/
 .env
 *.bak.*
+*.bak-*
+docs/agent-os/preflight/
+reports/deep-debug-swarm/
+reports/source-control-inventory/
+reports/mcp-task-queue-smoke-test-*.md
+
+# Generated artifacts (Horizon 1 cleanup 2026-05-28)
+us-execution/backtest_results/
+docs/agent-os/latest-preflight.json

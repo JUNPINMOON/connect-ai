@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Connect AI tool-execution-policy",
+  "type": "object",
+  "required": ["version", "mutable", "tiers", "safetyNets", "wiring"],
+  "properties": {
+    "version": { "type": "number" },
+    "description": { "type": "string" },
+    "mutable": { "const": false },
+    "principle": { "type": "object" },
+    "tiers": {
+      "type": "object",
+      "required": ["AUTO", "APPROVAL", "FORBIDDEN"],
+      "properties": {
+        "AUTO": { "type": "object" },
+        "APPROVAL": { "type": "object" },
+        "FORBIDDEN": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "perDepartmentOverrides": { "type": "object" },
+    "safetyNets": { "type": "object" },
+    "wiring": { "type": "object" }
+  },
+  "additionalProperties": true
+}

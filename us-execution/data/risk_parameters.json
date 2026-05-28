@@ -1,0 +1,64 @@
+{
+  "risk_parameters": {
+    "market_risk": {
+      "beta_limit": 1.5,
+      "correlation_limit": 0.7,
+      "sector_concentration_limit": 0.3,
+      "max_position_size": 0.1
+    },
+    "volatility_risk": {
+      "max_volatility": 0.35,
+      "volatility_adjustment_factor": 0.8,
+      "volatility_lookback_period": 60
+    },
+    "drawdown_risk": {
+      "max_portfolio_drawdown": 0.25,
+      "max_position_drawdown": 0.15,
+      "drawdown_recovery_period": 90
+    },
+    "liquidity_risk": {
+      "min_average_volume": 1000000,
+      "min_daily_trades": 500,
+      "max_position_percent_of_volume": 0.05
+    },
+    "concentration_risk": {
+      "max_positions_per_sector": 3,
+      "max_single_position_weight": 0.15,
+      "min_diversification_score": 0.7
+    }
+  },
+  "risk_adjusted_returns": {
+    "sharpe_ratio_target": 1.2,
+    "sortino_ratio_target": 1.8,
+    "max_downside_deviation": 0.15,
+    "var_confidence_level": 0.95,
+    "cvar_confidence_level": 0.99
+  },
+  "stress_scenarios": {
+    "market_crash": {
+      "probability": 0.02,
+      "impact_threshold": -0.20,
+      "recovery_period": 180
+    },
+    "sector_rotation": {
+      "probability": 0.15,
+      "impact_threshold": -0.10,
+      "recovery_period": 60
+    },
+    "liquidity_crisis": {
+      "probability": 0.05,
+      "impact_threshold": -0.15,
+      "recovery_period": 90
+    }
+  },
+  "risk_monitoring": {
+    "rebalancing_frequency": "weekly",
+    "risk_review_frequency": "monthly",
+    "stress_test_frequency": "quarterly",
+    "alert_thresholds": {
+      "portfolio_var": 0.08,
+      "position_loss": 0.05,
+      "correlation_spike": 0.85
+    }
+  }
+}

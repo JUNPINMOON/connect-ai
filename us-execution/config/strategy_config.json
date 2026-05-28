@@ -1,0 +1,101 @@
+{
+  "strategy": {
+    "name": "US Execution Strategy",
+    "version": "1.0.0",
+    "type": "momentum_reversal",
+    "market": "US_STOCKS",
+    "timeframe": "DAILY",
+    "description": "미국 주식 모멘텀 반전 전략 - 기술적 지표 기반 매매"
+  },
+  "trading_parameters": {
+    "max_positions": 10,
+    "position_size_percent": 10,
+    "stop_loss_percent": 5,
+    "take_profit_percent": 15,
+    "min_market_cap": 1000000000,
+    "max_position_value": 50000
+  },
+  "indicators": {
+    "rsi": {
+      "period": 14,
+      "oversold": 30,
+      "overbought": 70
+    },
+    "macd": {
+      "fast": 12,
+      "slow": 26,
+      "signal": 9
+    },
+    "moving_average": {
+      "short": 20,
+      "long": 50
+    },
+    "volume": {
+      "avg_period": 20,
+      "min_multiplier": 1.5
+    }
+  },
+  "entry_conditions": {
+    "momentum_signal": {
+      "rsi_oversold": true,
+      "macd_bullish_cross": true,
+      "volume_spike": true,
+      "price_above_ma": true
+    },
+    "risk_filters": {
+      "max_drawdown": 20,
+      "correlation_limit": 0.7,
+      "sector_exposure_limit": 30
+    }
+  },
+  "exit_conditions": {
+    "profit_taking": {
+      "rsi_overbought": true,
+      "macd_bearish_cross": true,
+      "target_profit": true
+    },
+    "stop_loss": {
+      "fixed_percent": true,
+      "trailing_stop": true,
+      "support_break": true
+    }
+  },
+  "risk_management": {
+    "portfolio_level": {
+      "max_drawdown": 25,
+      "var_confidence": 95,
+      "beta_limit": 1.5
+    },
+    "position_level": {
+      "max_loss_per_trade": 2,
+      "position_sizing_method": "fixed_percent",
+      "rebalance_frequency": "weekly"
+    }
+  },
+  "universe": {
+    "included_sectors": [
+      "Technology",
+      "Healthcare",
+      "Finance",
+      "Consumer Discretionary",
+      "Industrial"
+    ],
+    "excluded_sectors": [
+      "Energy",
+      "Utilities",
+      "Real Estate"
+    ],
+    "liquidity_filter": {
+      "min_avg_volume": 1000000,
+      "min_price": 10,
+      "max_price": 500
+    }
+  },
+  "backtest_settings": {
+    "start_date": "2020-01-01",
+    "end_date": "2024-12-31",
+    "initial_capital": 100000,
+    "commission": 0.001,
+    "slippage": 0.001
+  }
+}

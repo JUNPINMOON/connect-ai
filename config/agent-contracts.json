@@ -1,0 +1,553 @@
+{
+  "version": "1.0",
+  "updated": "2026-05-28",
+  "statusVocabulary": [
+    "READY_FOR_VERIFICATION",
+    "VERIFIED",
+    "PARTIAL",
+    "BLOCKED"
+  ],
+  "globalDoneRule": [
+    "filesChanged",
+    "commandsRun",
+    "testsPassedCurrentRun",
+    "unresolvedFailuresRecorded",
+    "generatedArtifactsClassified",
+    "separateVerifierAccepted"
+  ],
+  "contracts": [
+    {
+      "id": "codex-implementer",
+      "role": "implementer",
+      "assignee": "codex",
+      "workerClass": "executor",
+      "riskClassMax": "Yellow",
+      "authority": {
+        "canWriteRepo": true,
+        "canWriteRuntimeCompanyDir": true,
+        "canWriteVaultDirectly": false,
+        "canApproveHumanGates": false,
+        "canCloseDoneWithoutVerifier": false
+      },
+      "allowedWriteScopes": [
+        "${CONNECT_AI_REPO}/assigned-files",
+        "${COMPANY_DIR}/task-output"
+      ],
+      "forbiddenPaths": [
+        "${VAULT_ROOT}/_company",
+        "${VAULT_ROOT}/.obsidian",
+        "${VAULT_ROOT}/.connect-ai-locks",
+        "${VAULT_ROOT}/** except via scripts/vault-writer.js",
+        "credential, token, broker, live-trade, deploy, external-send paths unless explicit human approval"
+      ],
+      "inputRequired": [
+        "queueItemId",
+        "goal",
+        "riskClass",
+        "writeScope",
+        "expectedTests",
+        "rollbackPath"
+      ],
+      "outputRequired": [
+        "status=READY_FOR_VERIFICATION",
+        "filesChanged",
+        "commandsRun",
+        "testsPassed",
+        "unresolvedFailures",
+        "generatedArtifacts"
+      ],
+      "evidenceRequired": [
+        "current command output",
+        "diff summary",
+        "rollback notes"
+      ],
+      "expectedTests": [
+        "node --test for touched scripts",
+        "npx tsc --noEmit -p tsconfig.json when TypeScript or package wiring changes",
+        "npm run compile when extension or package wiring changes"
+      ],
+      "tokenBudget": "bounded",
+      "retryBudget": 1,
+      "stopConditions": [
+        "same failure repeats twice",
+        "write scope is missing or too broad",
+        "approval, credential, deploy, destructive, broker, or live-trade boundary appears",
+        "tests cannot be run or evidence cannot be produced"
+      ],
+      "humanApprovalRequiredWhen": [
+        "Red risk",
+        "vault root migration",
+        "destructive cleanup",
+        "credential or external account access",
+        "deploy/send/purchase/order execution"
+      ],
+      "doneRule": "READY_FOR_VERIFICATION only; DONE requires separate verifier acceptance and --verified"
+    },
+    {
+      "id": "claude-implementer",
+      "role": "implementer",
+      "assignee": "claude",
+      "workerClass": "executor",
+      "riskClassMax": "Yellow",
+      "authority": {
+        "canWriteRepo": true,
+        "canWriteRuntimeCompanyDir": true,
+        "canWriteVaultDirectly": false,
+        "canApproveHumanGates": false,
+        "canCloseDoneWithoutVerifier": false
+      },
+      "allowedWriteScopes": [
+        "${CONNECT_AI_REPO}/assigned-docs-or-code",
+        "${COMPANY_DIR}/task-output"
+      ],
+      "forbiddenPaths": [
+        "${VAULT_ROOT}/_company",
+        "${VAULT_ROOT}/.obsidian",
+        "${VAULT_ROOT}/** except via scripts/vault-writer.js",
+        "credential, token, broker, live-trade, deploy, external-send paths unless explicit human approval"
+      ],
+      "inputRequired": [
+        "queueItemId",
+        "goal",
+        "riskClass",
+        "writeScope",
+        "expectedTests",
+        "rollbackPath"
+      ],
+      "outputRequired": [
+        "status=READY_FOR_VERIFICATION",
+        "filesChanged",
+        "commandsRun",
+        "testsPassed",
+        "unresolvedFailures",
+        "generatedArtifacts"
+      ],
+      "evidenceRequired": [
+        "current command output",
+        "files inspected",
+        "diff summary",
+        "residual risks"
+      ],
+      "expectedTests": [
+        "focused tests named in the queue item",
+        "docs lint or contract validation when editing operating docs"
+      ],
+      "tokenBudget": "bounded",
+      "retryBudget": 1,
+      "stopConditions": [
+        "same failure repeats twice",
+        "prompt asks for broad rewrite without write scope",
+        "approval, credential, deploy, destructive, broker, or live-trade boundary appears"
+      ],
+      "humanApprovalRequiredWhen": [
+        "Red risk",
+        "vault root migration",
+        "destructive cleanup",
+        "credential or external account access"
+      ],
+      "doneRule": "READY_FOR_VERIFICATION only; DONE requires separate verifier acceptance and --verified"
+    },
+    {
+      "id": "gemini-verifier",
+      "role": "verifier",
+      "assignee": "gemini",
+      "workerClass": "reviewer",
+      "riskClassMax": "Green",
+      "authority": {
+        "canWriteRepo": false,
+        "canWriteRuntimeCompanyDir": true,
+        "canWriteVaultDirectly": false,
+        "canApproveHumanGates": false,
+        "canCloseDoneWithoutVerifier": false
+      },
+      "allowedWriteScopes": [
+        "${COMPANY_DIR}/review-output"
+      ],
+      "forbiddenPaths": [
+        "${CONNECT_AI_REPO}/** writes",
+        "${VAULT_ROOT}/**",
+        "credential, token, broker, live-trade, deploy, external-send paths"
+      ],
+      "inputRequired": [
+        "sourceQueueItemId",
+        "claimedFilesChanged",
+        "claimedCommandsRun",
+        "expectedTests",
+        "evidence"
+      ],
+      "outputRequired": [
+        "verdict=accept|reject|needs_human",
+        "filesInspected",
+        "commandsRun",
+        "evidenceChecked",
+        "residualRisks"
+      ],
+      "evidenceRequired": [
+        "independent file inspection",
+        "test evidence review",
+        "explicit verdict line"
+      ],
+      "expectedTests": [
+        "read-only inspection commands",
+        "no writes except reviewer output"
+      ],
+      "tokenBudget": "bounded",
+      "retryBudget": 0,
+      "stopConditions": [
+        "evidence is missing",
+        "task requires writes",
+        "human approval is claimed by an agent"
+      ],
+      "humanApprovalRequiredWhen": [
+        "verdict would require approving Red work",
+        "source task asks to bypass policy"
+      ],
+      "doneRule": "May emit verifier verdict only; cannot mark source task DONE directly"
+    },
+    {
+      "id": "antigravity-architecture-reviewer",
+      "role": "reviewer",
+      "assignee": "antigravity",
+      "workerClass": "reviewer",
+      "riskClassMax": "Green",
+      "authority": {
+        "canWriteRepo": false,
+        "canWriteRuntimeCompanyDir": true,
+        "canWriteVaultDirectly": false,
+        "canApproveHumanGates": false,
+        "canCloseDoneWithoutVerifier": false
+      },
+      "allowedWriteScopes": [
+        "${COMPANY_DIR}/architecture-review-output"
+      ],
+      "forbiddenPaths": [
+        "${CONNECT_AI_REPO}/** writes",
+        "${VAULT_ROOT}/**",
+        "credential, token, broker, live-trade, deploy, external-send paths"
+      ],
+      "inputRequired": [
+        "architectureQuestion",
+        "filesToInspect",
+        "riskClass",
+        "expectedOutput"
+      ],
+      "outputRequired": [
+        "architectureVerdict",
+        "filesInspected",
+        "risks",
+        "recommendedNextSlice",
+        "noWriteConfirmation"
+      ],
+      "evidenceRequired": [
+        "files inspected",
+        "tradeoff list",
+        "specific next-slice recommendation"
+      ],
+      "expectedTests": [
+        "read-only architecture review only"
+      ],
+      "tokenBudget": "bounded",
+      "retryBudget": 0,
+      "stopConditions": [
+        "prompt asks for direct edits",
+        "credential or approval boundary appears",
+        "review cannot cite inspected files"
+      ],
+      "humanApprovalRequiredWhen": [
+        "Red work is recommended",
+        "external state changes are proposed"
+      ],
+      "doneRule": "Reviewer output only; cannot claim implementation DONE or bypass verifier boundary"
+    },
+    {
+      "id": "hermes-observer",
+      "role": "researcher",
+      "assignee": "hermes",
+      "workerClass": "observer",
+      "riskClassMax": "Green",
+      "authority": {
+        "canWriteRepo": false,
+        "canWriteRuntimeCompanyDir": true,
+        "canWriteVaultDirectly": false,
+        "canApproveHumanGates": false,
+        "canCloseDoneWithoutVerifier": false
+      },
+      "allowedWriteScopes": [
+        "${COMPANY_DIR}/observer-output"
+      ],
+      "forbiddenPaths": [
+        "${CONNECT_AI_REPO}/** writes",
+        "${VAULT_ROOT}/**",
+        "approval closure",
+        "credential, token, broker, live-trade, deploy, external-send paths"
+      ],
+      "inputRequired": [
+        "observationGoal",
+        "sources",
+        "riskClass",
+        "expectedSummary"
+      ],
+      "outputRequired": [
+        "observations",
+        "sourcesChecked",
+        "uncertainties",
+        "needsHumanDecision"
+      ],
+      "evidenceRequired": [
+        "source list",
+        "non-secret summary",
+        "clear uncertainty list"
+      ],
+      "expectedTests": [
+        "read-only observation only"
+      ],
+      "tokenBudget": "short",
+      "retryBudget": 0,
+      "stopConditions": [
+        "task asks to approve or close an approval gate",
+        "task asks for code edits",
+        "task enters credential or external send boundary"
+      ],
+      "humanApprovalRequiredWhen": [
+        "any action beyond observation is needed"
+      ],
+      "doneRule": "Observer output only; never DONE for implementation or approval tasks"
+    },
+    {
+      "id": "local-llm-smoke",
+      "role": "local-smoke",
+      "assignee": "local-llm",
+      "workerClass": "local-smoke",
+      "riskClassMax": "Green",
+      "authority": {
+        "canWriteRepo": false,
+        "canWriteRuntimeCompanyDir": true,
+        "canWriteVaultDirectly": false,
+        "canApproveHumanGates": false,
+        "canCloseDoneWithoutVerifier": false
+      },
+      "allowedWriteScopes": [
+        "${COMPANY_DIR}/local-smoke-output"
+      ],
+      "forbiddenPaths": [
+        "${CONNECT_AI_REPO}/** writes",
+        "${VAULT_ROOT}/**",
+        "credential, token, broker, live-trade, deploy, external-send paths"
+      ],
+      "inputRequired": [
+        "shortPrompt",
+        "classificationChoices",
+        "timeoutMs",
+        "expectedOutputShape"
+      ],
+      "outputRequired": [
+        "classification",
+        "confidence",
+        "latencyMs",
+        "modelName",
+        "fallbackUsed"
+      ],
+      "evidenceRequired": [
+        "model name",
+        "latency",
+        "bounded prompt and output"
+      ],
+      "expectedTests": [
+        "cheap classification or sanity check only"
+      ],
+      "tokenBudget": "short",
+      "retryBudget": 1,
+      "stopConditions": [
+        "model is unavailable",
+        "prompt exceeds short classification scope",
+        "task requires reasoning, coding, approval, or writes"
+      ],
+      "humanApprovalRequiredWhen": [
+        "local model would access secrets or external state"
+      ],
+      "doneRule": "Smoke output only; cannot mark source task DONE or bypass verifier boundary"
+    },
+    {
+      "id": "vault-writer",
+      "role": "implementer",
+      "assignee": "vault-writer",
+      "workerClass": "single-writer",
+      "riskClassMax": "Yellow",
+      "authority": {
+        "canWriteRepo": false,
+        "canWriteRuntimeCompanyDir": true,
+        "canWriteVaultDirectly": true,
+        "canApproveHumanGates": false,
+        "canCloseDoneWithoutVerifier": false
+      },
+      "allowedWriteScopes": [
+        "${VAULT_ROOT}/00_MOC",
+        "${VAULT_ROOT}/decisions",
+        "${VAULT_ROOT}/runbooks",
+        "${VAULT_ROOT}/inbox",
+        "${VAULT_ROOT}/wiki",
+        "${VAULT_ROOT}/agent-guides",
+        "${VAULT_ROOT}/codex-memory",
+        "${VAULT_ROOT}/youtube",
+        "${COMPANY_DIR}/vault-writer"
+      ],
+      "forbiddenPaths": [
+        "${VAULT_ROOT}/_company",
+        "${VAULT_ROOT}/.obsidian",
+        "${VAULT_ROOT}/.connect-ai-locks",
+        "root note moves unless --execute --approved and approval packet exists"
+      ],
+      "inputRequired": [
+        "relPath",
+        "type",
+        "status",
+        "project",
+        "owner",
+        "source",
+        "links",
+        "body",
+        "dryRunOrExecute"
+      ],
+      "outputRequired": [
+        "ok",
+        "wrote",
+        "mode",
+        "relPath",
+        "path",
+        "writeLogOrRejectReason"
+      ],
+      "evidenceRequired": [
+        "frontmatter schema",
+        "required MOC link",
+        "duplicate check",
+        "write log or rejected-writes log"
+      ],
+      "expectedTests": [
+        "node --test scripts/vault-writer.test.js",
+        "synthetic write test when policy changes"
+      ],
+      "tokenBudget": "short",
+      "retryBudget": 0,
+      "stopConditions": [
+        "policy validation fails",
+        "duplicate note exists",
+        "path is outside allowed folder",
+        "root migration lacks explicit approval"
+      ],
+      "humanApprovalRequiredWhen": [
+        "root note migration",
+        "rollback of root note migration",
+        "bulk durable note writes beyond approved batch"
+      ],
+      "doneRule": "Writer reports write result only; source task still needs verifier for DONE"
+    },
+    {
+      "id": "browser-smoke",
+      "role": "verifier",
+      "assignee": "browser",
+      "workerClass": "ui-smoke",
+      "riskClassMax": "Green",
+      "authority": {
+        "canWriteRepo": false,
+        "canWriteRuntimeCompanyDir": true,
+        "canWriteVaultDirectly": false,
+        "canApproveHumanGates": false,
+        "canCloseDoneWithoutVerifier": false
+      },
+      "allowedWriteScopes": [
+        "${COMPANY_DIR}/browser-smoke-output"
+      ],
+      "forbiddenPaths": [
+        "${CONNECT_AI_REPO}/** writes",
+        "${VAULT_ROOT}/**",
+        "credential, token, broker, live-trade, deploy, external-send paths"
+      ],
+      "inputRequired": [
+        "targetUrlOrSurface",
+        "flowUnderTest",
+        "expectedVisibleState",
+        "consolePolicy"
+      ],
+      "outputRequired": [
+        "url",
+        "title",
+        "notBlankEvidence",
+        "consoleHealth",
+        "screenshotPathOrDescription",
+        "interactionProof"
+      ],
+      "evidenceRequired": [
+        "page identity",
+        "DOM or screenshot evidence",
+        "console errors and warnings",
+        "interaction result"
+      ],
+      "expectedTests": [
+        "Browser or Chrome smoke only when UI/runtime browser surface changed"
+      ],
+      "tokenBudget": "short",
+      "retryBudget": 1,
+      "stopConditions": [
+        "target URL is unknown",
+        "authentication or credential boundary appears",
+        "browser tool fails and no fallback was approved"
+      ],
+      "humanApprovalRequiredWhen": [
+        "credential entry or external account mutation is needed"
+      ],
+      "doneRule": "UI verifier output only; cannot mark implementation DONE directly"
+    },
+    {
+      "id": "coderabbit-review-gate",
+      "role": "reviewer",
+      "assignee": "coderabbit",
+      "workerClass": "reviewer",
+      "riskClassMax": "Green",
+      "authority": {
+        "canWriteRepo": false,
+        "canWriteRuntimeCompanyDir": true,
+        "canWriteVaultDirectly": false,
+        "canApproveHumanGates": false,
+        "canCloseDoneWithoutVerifier": false
+      },
+      "allowedWriteScopes": [
+        "${COMPANY_DIR}/coderabbit-review-output"
+      ],
+      "forbiddenPaths": [
+        "${CONNECT_AI_REPO}/** writes",
+        "${VAULT_ROOT}/**",
+        "credential, token, broker, live-trade, deploy, external-send paths"
+      ],
+      "inputRequired": [
+        "diffScope",
+        "localVerificationSummary",
+        "configFile",
+        "timeoutWindow"
+      ],
+      "outputRequired": [
+        "issuesBySeverity",
+        "filesReferenced",
+        "exactFailureIfReviewFails",
+        "noManualReviewSubstitution"
+      ],
+      "evidenceRequired": [
+        "CodeRabbit CLI output or exact timeout/failure",
+        "issue severity and file path"
+      ],
+      "expectedTests": [
+        "coderabbit review --agent with smallest safe scope after local verification"
+      ],
+      "tokenBudget": "external-tool",
+      "retryBudget": 0,
+      "stopConditions": [
+        "CLI unauthenticated",
+        "review times out",
+        "diff scope is too broad for reliable review"
+      ],
+      "humanApprovalRequiredWhen": [
+        "review requires external auth changes or account mutation"
+      ],
+      "doneRule": "Review gate output only; never invent CodeRabbit results or bypass verifier boundary"
+    }
+  ]
+}

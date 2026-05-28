@@ -1,0 +1,17 @@
+{
+  "name": "mcp",
+  "version": "1.0.0",
+  "description": "Connect AI stdio MCP server for Hermes tool calls",
+  "main": "server.js",
+  "scripts": {
+    "smoke": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  }
+}

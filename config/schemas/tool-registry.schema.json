@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "tool-registry",
+  "type": "object",
+  "required": ["version", "tools"],
+  "properties": {
+    "version": { "type": "integer" },
+    "description": { "type": "string" },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "risk", "mutable"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+          "type": { "enum": ["service", "project-cli"] },
+          "url": { "type": "string", "pattern": "^http://127\\.0\\.0\\.1:" },
+          "host": { "type": "string" },
+          "hostOverrideApproved": { "type": "boolean" },
+          "projectId": { "type": "string" },
+          "risk": { "enum": ["low", "medium", "high"] },
+          "mutable": { "const": false },
+          "approvalRequiredForRun": { "type": "boolean" },
+          "notes": { "type": "string" }
+        },
+        "additionalProperties": false,
+        "allOf": [
+          { "if": { "properties": { "type": { "const": "service" } } },
+            "then": { "required": ["url"] } },
+          { "if": { "properties": { "type": { "const": "project-cli" } } },
+            "then": { "required": ["projectId"] } }
+        ]
+      }
+    }
+  },
+  "additionalProperties": false
+}

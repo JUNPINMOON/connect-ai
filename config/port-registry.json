@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "ports": [
+    {
+      "id": "ollama",
+      "host": "127.0.0.1",
+      "port": 11434,
+      "owner": "Ollama",
+      "mutable": false
+    },
+    {
+      "id": "lm-studio",
+      "host": "127.0.0.1",
+      "port": 1234,
+      "owner": "LM Studio local server",
+      "mutable": false
+    },
+    {
+      "id": "connect-ai-brain-inject",
+      "host": "127.0.0.1",
+      "port": 4825,
+      "owner": "Connect AI extension local brain injection server",
+      "mutable": false
+    },
+    {
+      "id": "local-dashboard-common",
+      "host": "127.0.0.1",
+      "port": 8771,
+      "owner": "Digital Nomad local static site preview",
+      "mutable": false
+    }
+  ]
+}

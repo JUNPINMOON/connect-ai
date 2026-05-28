@@ -2,6 +2,7 @@ const vscode = acquireVsCodeApi();
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const fmt = (n) => { n = Number(n)||0; if(n>=1e9) return (n/1e9).toFixed(1)+'B'; if(n>=1e6) return (n/1e6).toFixed(1)+'M'; if(n>=1e3) return (n/1e3).toFixed(1)+'K'; return String(n); };
+let agentQueueFilter = 'active';
 
 /* Animated count-up — eases from current displayed number to target. */
 function animateNum(el, targetRaw) {
@@ -69,7 +70,7 @@ function toast(text, err) {
 
 /* Buttons */
 $('refreshBtn').onclick = () => vscode.postMessage({ type: 'refresh' });
-$('briefBtn').onclick   = () => vscode.postMessage({ type: 'fireBriefing' });
+$('briefBtn').onclick   = () => vscode.postMessage({ type: 'diagnoseConnection' });
 $('queueBtn').onclick   = () => vscode.postMessage({ type: 'queueComments' });
 /* v2.89.24 — 보고 스케줄 모달 */
 $('scheduleBtn').onclick = () => { vscode.postMessage({ type: 'getReportSchedule' }); };
@@ -261,6 +262,13 @@ function render(s) {
     teamBody.innerHTML = s.agentTeam.map(a => {
       const isLocked = (a.lockable && !a.hired);
       const isInactive = (!isLocked && a.togglable && !a.active);
+      const roleMeta = (a.roleMeta && typeof a.roleMeta === 'object') ? a.roleMeta : {};
+      const executor = String(roleMeta.executor || '').trim();
+      const opsStatus = String(roleMeta.status || '').trim();
+      const isConnected = executor && executor !== 'none' && opsStatus !== 'not_connected' && opsStatus !== 'hiring_wait';
+      const executorBadge = executor
+        ? '<div class="agent-executor-badge '+(isConnected ? 'connected' : 'not-connected')+'" title="executor: '+esc(executor)+'">'+esc(isConnected ? executor : '미연결')+'</div>'
+        : '';
       const photoHtml = a.profileImageUri
         ? '<div class="agent-photo" style="background-image:url(\'' + esc(a.profileImageUri) + '\')"></div>'
         : '<div class="agent-photo no-photo">' + esc(a.emoji) + '</div>';
@@ -281,6 +289,7 @@ function render(s) {
           +   '<div class="agent-overlay"></div>'
           +   '<div class="agent-glitch"></div>'
           +   '<div class="agent-lock-badge">🔒</div>'
+          +   executorBadge
           +   '<div class="agent-hover-info">CLEARANCE REQUIRED · 클릭해서 채용 인증</div>'
           +   '<div class="agent-name-strip">'
           +     '<div>??? ??? ???</div>'
@@ -295,6 +304,7 @@ function render(s) {
           +   photoHtml
           +   '<div class="agent-overlay"></div>'
           +   '<div class="agent-inactive-badge">⏸</div>'
+          +   executorBadge
           +   '<div class="agent-hover-info">OFFLINE · 클릭해서 활성화</div>'
           +   '<div class="agent-name-strip">'
           +     '<div>' + esc(a.name) + '</div>'
@@ -307,6 +317,7 @@ function render(s) {
         +   '<div class="agent-overlay"></div>'
         +   activeDot
         +   taskBadge
+        +   executorBadge
         +   tooltip
         +   '<div class="agent-name-strip">'
         +     '<div>' + esc(a.name) + '</div>'
@@ -353,8 +364,194 @@ function render(s) {
     teamBody.innerHTML = '<div class="empty subtle">에이전트 정보를 불러오는 중...</div>';
   }
 
+  renderTeamRoom(s.workerStatus || {}, s.workerHealth || {}, s.agentQueue || []);
+  renderAgentQueue(s.agentQueue || [], s.agentQueuePath || '');
+
   /* v2.83: activity log section removed — raw conversation log lives in
      the brain folder for power users; daily summary is in 텔레그램 브리핑. */
+}
+
+function renderTeamRoom(workerStatus, workerHealth, queueItems) {
+  const stage = $('teamRoomStage');
+  const badge = $('teamRoomBadge');
+  if (!stage) return;
+  const agents = [
+    ['codex', '⚡', 'Codex', 'Executor', '코드 데스크'],
+    ['claude', '🧠', 'Claude', 'Executor', '전략 회의실'],
+    ['gemini', '◆', 'Gemini', 'Reviewer', '검토 보드'],
+    ['antigravity', '▲', 'Antigravity', 'Reviewer', '품질 관제'],
+    ['hermes', '🪽', 'Hermes', 'Observer', '관찰석'],
+  ];
+  const healthAgents = (workerHealth && workerHealth.agents) ? workerHealth.agents : {};
+  const activeQueue = (Array.isArray(queueItems) ? queueItems : []).filter(item => item.status === 'running');
+  const activeCount = agents.filter(([id]) => {
+    const st = workerStatus[id] || {};
+    return st.status === 'running' || activeQueue.some(item => item.assignee === id);
+  }).length;
+  if (badge) badge.textContent = activeCount + ' active';
+  const agentViews = agents.map(([id, icon, label, role, zone], idx) => {
+    const st = workerStatus[id] || {};
+    const health = healthAgents[id] || {};
+    const running = activeQueue.find(item => item.assignee === id);
+    const status = String(st.status || (running ? 'running' : 'idle'));
+    const healthStatus = String(health.status || 'UNKNOWN');
+    const taskTitle = String(st.taskTitle || (running && running.title) || '대기 중');
+    const message = String(st.message || health.detail || '');
+    const stateClass = status === 'running' ? 'running'
+      : status === 'blocked' || /AUTH|MISSING|TIMEOUT|BROKEN|RATE_LIMIT|QUOTA/i.test(healthStatus) ? 'blocked'
+      : status === 'done' ? 'done'
+      : healthStatus === 'READY' ? 'ready' : 'idle';
+    return { id, icon, label, role, zone, idx, status, healthStatus, taskTitle, message, stateClass };
+  });
+  stage.innerHTML =
+    '<div class="office-floor" aria-label="Connect AI live team room">'
+    +   '<div class="office-grid-lines"></div>'
+    +   '<div class="office-zone zone-code"><span>CODE</span></div>'
+    +   '<div class="office-zone zone-review"><span>REVIEW</span></div>'
+    +   '<div class="office-zone zone-queue"><span>QUEUE</span></div>'
+    +   '<div class="office-zone zone-observe"><span>OBSERVE</span></div>'
+    +   agentViews.map(a =>
+          '<div class="office-person '+esc(a.stateClass)+' office-person-'+esc(a.id)+'" style="--agent-i:'+a.idx+'">'
+        +   '<div class="person-shadow"></div>'
+        +   '<div class="person-body">'
+        +     '<div class="person-face">'+esc(a.icon)+'</div>'
+        +     '<div class="person-label">'+esc(a.label)+'</div>'
+        +   '</div>'
+        +   '<div class="person-bubble">'
+        +     '<strong>'+esc(a.status === 'running' ? '작업 중' : a.stateClass === 'blocked' ? (/RATE_LIMIT|QUOTA/i.test(a.healthStatus) ? 'quota 제한' : '막힘') : a.healthStatus === 'READY' ? '대기' : a.status)+'</strong>'
+        +     '<span>'+esc(a.taskTitle).slice(0, 46)+'</span>'
+        +   '</div>'
+        + '</div>'
+        ).join('')
+    + '</div>'
+    + '<div class="room-status-rail">'
+    + agentViews.map(a =>
+        '<div class="room-agent '+esc(a.stateClass)+' room-agent-'+esc(a.id)+'">'
+      +   '<div class="room-avatar">'+esc(a.icon)+'</div>'
+      +   '<div class="room-main">'
+      +     '<div class="room-name">'+esc(a.label)+'<span>'+esc(a.role)+'</span></div>'
+      +     '<div class="room-task">'+esc(a.taskTitle)+'</div>'
+      +     '<div class="room-meta"><span>'+esc(a.status)+'</span><span>'+esc(a.healthStatus)+'</span><span>'+esc(a.zone)+'</span></div>'
+      +   '</div>'
+      + '</div>'
+      ).join('')
+    + '</div>';
+}
+
+function renderAgentQueue(items, queuePath) {
+  const body = $('agentQueueBody');
+  const badge = $('agentQueueBadge');
+  const filters = $('agentQueueFilters');
+  if (!body) return;
+  const list = Array.isArray(items) ? items : [];
+  const counts = list.reduce((acc, item) => {
+    const key = item.status || 'queued';
+    acc[key] = (acc[key] || 0) + 1;
+    if (key !== 'done') acc.active += 1;
+    return acc;
+  }, { all: list.length, active: 0, queued: 0, copied: 0, running: 0, done: 0, blocked: 0 });
+  if (badge) badge.textContent = counts.active + ' active / ' + list.length + ' total';
+  if (filters) {
+    const opts = [
+      ['active', 'active', counts.active],
+      ['queued', 'queued', counts.queued],
+      ['copied', 'copied', counts.copied],
+      ['running', 'running', counts.running],
+      ['blocked', 'blocked', counts.blocked],
+      ['done', 'done', counts.done],
+      ['all', 'all', counts.all],
+    ];
+    filters.innerHTML = opts.map(([key, label, count]) =>
+      '<button class="aq-filter '+(agentQueueFilter === key ? 'active' : '')+'" type="button" data-filter="'+esc(key)+'">'
+      + esc(label) + ' <span>' + esc(count) + '</span></button>'
+    ).join('');
+    filters.querySelectorAll('.aq-filter').forEach(btn => {
+      btn.addEventListener('click', () => {
+        agentQueueFilter = btn.dataset.filter || 'active';
+        renderAgentQueue(list, queuePath);
+      });
+    });
+  }
+  if (list.length === 0) {
+    body.innerHTML = '<div class="empty subtle">아직 분배된 작업이 없어요. scripts/agent-queue.js add 또는 Hermes 큐 생성으로 채울 수 있습니다.</div>';
+    return;
+  }
+  const assigneeIcon = { codex: '⚡', claude: '🧠', hermes: '🪽', gemini: '◆', antigravity: '▲' };
+  const order = { P0: 0, P1: 1, P2: 2 };
+  const shown = list.filter(item => {
+    const status = item.status || 'queued';
+    if (agentQueueFilter === 'all') return true;
+    if (agentQueueFilter === 'active') return status !== 'done';
+    return status === agentQueueFilter;
+  });
+  if (shown.length === 0) {
+    body.innerHTML = '<div class="empty subtle">현재 필터에 해당하는 작업이 없습니다.</div>';
+    return;
+  }
+  body.innerHTML = shown.slice().sort((a,b) => (order[a.priority] ?? 9) - (order[b.priority] ?? 9)).map(item => {
+    const files = Array.isArray(item.files) && item.files.length
+      ? item.files.slice(0, 4).map(f => '<span class="aq-file">'+esc(f)+'</span>').join('')
+      : '<span class="aq-file muted">파일 범위 없음</span>';
+    const preview = String(item.prompt || '').replace(/\s+/g, ' ').slice(0, 220);
+    const resultSummary = String(item.resultSummary || '').replace(/\s+/g, ' ').slice(0, 240);
+    const claimedBy = String(item.claimedBy || '').replace(/\s+/g, ' ').slice(0, 80);
+    const claimedAt = String(item.claimedAt || '').replace(/\s+/g, ' ').slice(0, 40);
+    const blockedReason = item.blockedReason && typeof item.blockedReason === 'object' ? item.blockedReason : null;
+    const blockedReasonLabel = blockedReason ? String(blockedReason.label || blockedReason.code || '').slice(0, 80) : '';
+    const blockedReasonCode = blockedReason ? String(blockedReason.code || '').slice(0, 80) : '';
+    const claimMeta = claimedBy
+      ? '<div class="aq-claim">claimed by <span>'+esc(claimedBy)+'</span>'+(claimedAt ? ' · '+esc(claimedAt) : '')+'</div>'
+      : '';
+    return '<div class="aq-card aq-'+esc(item.status || 'queued')+'" data-id="'+esc(item.id)+'">'
+      + '<div class="aq-top">'
+      +   '<span class="aq-assignee">'+esc(assigneeIcon[item.assignee] || '🤖')+' '+esc(item.assignee || 'codex')+'</span>'
+      +   '<span class="aq-priority">'+esc(item.priority || 'P1')+'</span>'
+      +   '<span class="aq-status">'+esc(item.status || 'queued')+'</span>'
+      + '</div>'
+      + '<div class="aq-title">'+esc(item.title || 'Untitled task')+'</div>'
+      + claimMeta
+      + (blockedReason ? '<div class="aq-blocked-reason"><span>blocked reason</span>'+esc(blockedReasonLabel || '원인 미분류')+(blockedReasonCode ? '<code>'+esc(blockedReasonCode)+'</code>' : '')+'</div>' : '')
+      + '<div class="aq-files">'+files+'</div>'
+      + '<div class="aq-preview">'+esc(preview || '프롬프트 없음')+'</div>'
+      + (resultSummary ? '<div class="aq-result"><span>결과</span>'+esc(resultSummary)+'</div>' : '')
+      + '<textarea class="aq-result-input" rows="3" data-id="'+esc(item.id)+'" placeholder="결과 요약 입력: 완료 내용, 검증, 남은 리스크">'+esc(item.resultSummary || '')+'</textarea>'
+      + '<div class="aq-actions">'
+      +   '<button class="btn small aq-copy" type="button" data-id="'+esc(item.id)+'">프롬프트 복사</button>'
+      +   '<button class="btn small aq-save-result" type="button" data-id="'+esc(item.id)+'">결과 저장</button>'
+      +   '<button class="btn small aq-status-btn" type="button" data-status="running" data-id="'+esc(item.id)+'">running</button>'
+      +   '<button class="btn small aq-status-btn" type="button" data-status="done" data-id="'+esc(item.id)+'">done</button>'
+      +   '<button class="btn small danger aq-status-btn" type="button" data-status="blocked" data-id="'+esc(item.id)+'">blocked</button>'
+      + '</div>'
+      + '</div>';
+  }).join('');
+  body.querySelectorAll('.aq-copy').forEach(btn => {
+    btn.addEventListener('click', () => vscode.postMessage({ type: 'copyAgentQueuePrompt', id: btn.dataset.id }));
+  });
+  body.querySelectorAll('.aq-save-result').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const input = body.querySelector('.aq-result-input[data-id="'+CSS.escape(btn.dataset.id || '')+'"]');
+      const card = btn.closest('.aq-card');
+      const statusEl = card ? card.querySelector('.aq-status') : null;
+      vscode.postMessage({
+        type: 'updateAgentQueueStatus',
+        id: btn.dataset.id,
+        status: statusEl ? statusEl.textContent : 'running',
+        resultSummary: input ? input.value : ''
+      });
+    });
+  });
+  body.querySelectorAll('.aq-status-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const input = body.querySelector('.aq-result-input[data-id="'+CSS.escape(btn.dataset.id || '')+'"]');
+      vscode.postMessage({
+        type: 'updateAgentQueueStatus',
+        id: btn.dataset.id,
+        status: btn.dataset.status,
+        resultSummary: input ? input.value : undefined
+      });
+    });
+  });
+  if (queuePath) body.title = 'queue: ' + queuePath;
 }
 
 /* v2.87.7 — 에이전트 상세 모달. 카드 클릭 시 사진·역할·스킬·검증된 지식
@@ -1022,6 +1219,42 @@ function showAgentDetailModal(a){
   const hero = a.profileImageUri
     ? '<div class="adm-hero" style="background-image:url(\''+esc(a.profileImageUri)+'\')"></div>'
     : '<div class="adm-hero adm-hero-emoji"><div class="adm-hero-emoji-glyph">'+esc(a.emoji)+'</div></div>';
+  const roleMeta = (a.roleMeta && typeof a.roleMeta === 'object') ? a.roleMeta : {};
+  const metaList = (v) => Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.trim()).map(x => x.trim()) : [];
+  const executor = (roleMeta.executor || '').trim();
+  const opsStatus = (roleMeta.status || '').trim();
+  const riskLevel = (roleMeta.riskLevel || '').trim();
+  const nextAction = (roleMeta.nextAction || '').trim();
+  const primaryNotes = metaList(roleMeta.primaryNotes);
+  const allowedTools = metaList(roleMeta.allowedTools);
+  const approvalTools = metaList(roleMeta.approvalTools);
+  const forbiddenTools = metaList(roleMeta.forbiddenTools);
+  const uiBadges = metaList(roleMeta.uiBadges);
+  const chips = (items, cls) => items.length
+    ? items.map(x => '<span class="adm-meta-chip '+cls+'">'+esc(x)+'</span>').join('')
+    : '<span class="adm-meta-empty">없음</span>';
+  const metaSummary = (executor || opsStatus || riskLevel || uiBadges.length)
+    ? '<div class="adm-meta-summary">'
+      + (executor ? '<span class="adm-meta-pill">executor: '+esc(executor)+'</span>' : '')
+      + (opsStatus ? '<span class="adm-meta-pill">status: '+esc(opsStatus)+'</span>' : '')
+      + (riskLevel ? '<span class="adm-meta-pill risk-'+esc(riskLevel.toLowerCase())+'">risk: '+esc(riskLevel)+'</span>' : '')
+      + uiBadges.map(b => '<span class="adm-meta-pill badge">'+esc(b)+'</span>').join('')
+      + '</div>'
+    : '';
+  const roleMetaBlock = (executor || opsStatus || riskLevel || primaryNotes.length || allowedTools.length || approvalTools.length || forbiddenTools.length || nextAction)
+    ? '<div class="adm-role-meta">'
+      + '<div class="adm-section-title-mini">운영 연결</div>'
+      + '<div class="adm-meta-caption">로컬 도구와 민감 MCP 도구에 일부 정책 가드가 적용됩니다. 승인 큐 실행 연결은 다음 단계입니다.</div>'
+      + metaSummary
+      + '<div class="adm-meta-grid">'
+      +   '<div class="adm-meta-row"><div class="adm-meta-label">담당 노트</div><div class="adm-meta-values">'+chips(primaryNotes, 'note')+'</div></div>'
+      +   '<div class="adm-meta-row"><div class="adm-meta-label">AUTO 도구</div><div class="adm-meta-values">'+chips(allowedTools, 'tool')+'</div></div>'
+      +   '<div class="adm-meta-row"><div class="adm-meta-label">승인 필요</div><div class="adm-meta-values">'+chips(approvalTools, 'approval')+'</div></div>'
+      +   '<div class="adm-meta-row"><div class="adm-meta-label">금지</div><div class="adm-meta-values">'+chips(forbiddenTools, 'forbidden')+'</div></div>'
+      + '</div>'
+      + (nextAction ? '<div class="adm-meta-next"><span>다음 액션</span>'+esc(nextAction)+'</div>' : '')
+      + '</div>'
+    : '';
   const skillsActive = (a.skills||[]).filter(s => s.enabled && !s.locked).length;
   const stats = ''
     + '<div class="adm-stat"><div class="adm-stat-icon">📚</div><div class="adm-stat-num">'+(a.verifiedCount||0)+'</div></div>'
@@ -1060,6 +1293,7 @@ function showAgentDetailModal(a){
     +   '<div class="adm-name">'+esc(a.name)+'</div>'
     +   '<div class="adm-role">'+esc(a.role||'')+'</div>'
     +   (a.tagline ? '<div class="adm-tagline">'+esc(a.tagline)+'</div>' : '')
+    +   roleMetaBlock
     +   '<div class="adm-stats">'+stats+'</div>'
     +   '<div class="adm-rag-row">'+ragChip+'</div>'
     +   ragCriteriaBlock

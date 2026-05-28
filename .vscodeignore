@@ -1,6 +1,7 @@
 .vscode/**
 .claude/**
 .secondbrain/**
+.tmp/**
 .git/**
 .github/**
 .env
@@ -10,6 +11,7 @@ src/**
 # v2.89.84 — extension_download_site/ 와 releases/ 디렉토리 삭제됨.
 # scripts/cycle.js 는 standalone 24h cron 옵션 도구로 유지 (vsix 제외).
 scripts/**
+mcp/node_modules/**
 system_schema.json
 # 한글 파일명이 vsix에 깨진 상태로 들어가던 튜토리얼 docs 제외.
 **/*.md

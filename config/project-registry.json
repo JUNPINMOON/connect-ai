@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "description": "Read-only department registry for local projects connected to Connect AI.",
+  "departments": [
+    {
+      "id": "ai-tool-research",
+      "name": "AI Tool Research",
+      "role": "AI tools, software discovery, overseas monetization lead research",
+      "root": "C:\\Users\\mjb58\\Documents\\Codex\\2026-05-16\\ai-git-software-discovery",
+      "risk": "low",
+      "mutable": false,
+      "approvalRequiredForRun": true,
+      "statusCommands": [
+        {
+          "id": "sources",
+          "cwd": ".",
+          "command": "python -m aigsd sources"
+        },
+        {
+          "id": "dashboard",
+          "cwd": ".",
+          "command": "python -m aigsd dashboard"
+        }
+      ],
+      "outputs": [
+        "reports",
+        "docs\\continuity\\current.md",
+        "docs\\research\\EVALUATION_TABLE.md"
+      ]
+    },
+    {
+      "id": "job-search",
+      "name": "Job Search",
+      "role": "Job collection, scoring, CRM, dashboard, application artifacts",
+      "root": "C:\\Users\\mjb58\\job_search",
+      "risk": "medium",
+      "mutable": false,
+      "approvalRequiredForRun": true,
+      "statusCommands": [
+        {
+          "id": "diagnose",
+          "cwd": ".",
+          "command": "python tools\\diagnose_pipeline.py"
+        }
+      ],
+      "outputs": [
+        "run_status.json",
+        "source_health.json",
+        "scored_jobs.json",
+        "dashboard"
+      ]
+    },
+    {
+      "id": "stock-research",
+      "name": "Stock Research",
+      "role": "Broker-free stock decision support and research reports",
+      "root": "C:\\openclaw\\projects\\us-execution",
+      "risk": "high",
+      "mutable": false,
+      "approvalRequiredForRun": true,
+      "statusCommands": [
+        {
+          "id": "guard",
+          "cwd": ".",
+          "command": "python tools\\guard_protected_files.py verify --root . --baseline data\\harness\\harness_protection_baseline.json"
+        }
+      ],
+      "outputs": [
+        "data\\decision_assistant",
+        "docs\\decision_assistant_next_architecture_session.md"
+      ],
+      "boundaries": [
+        "No broker calls",
+        "No live trading",
+        "No token refresh",
+        "Decision support only"
+      ]
+    },
+    {
+      "id": "digital-nomad",
+      "name": "Digital Nomad Value Lab",
+      "role": "Independent income strategy, AdSense-ready site, no-customer experiments",
+      "root": "C:\\Users\\mjb58\\OneDrive\\Documents\\디지털노마드",
+      "risk": "medium",
+      "mutable": false,
+      "approvalRequiredForRun": true,
+      "statusCommands": [
+        {
+          "id": "build-db",
+          "cwd": ".",
+          "command": "python .\\scripts\\build_sidehustle_database.py"
+        }
+      ],
+      "outputs": [
+        "docs\\continuity\\current.md",
+        "site\\adsense-automation",
+        "site\\no-customer-ideas"
+      ]
+    },
+    {
+      "id": "youtube-intelligence",
+      "name": "YouTube Intelligence",
+      "role": "Video transcript extraction and analysis pipeline",
+      "root": "C:\\openclaw\\projects\\youtube-analysis",
+      "risk": "low",
+      "mutable": false,
+      "approvalRequiredForRun": true,
+      "statusCommands": [
+        {
+          "id": "dry-run",
+          "cwd": "CgniMVyJtmg\\analyzer",
+          "command": "python video_analysis_pipeline.py --dry-run"
+        }
+      ],
+      "outputs": [
+        "CgniMVyJtmg\\CgniMVyJtmg_VIDEO_ANALYSIS.md",
+        "CgniMVyJtmg\\CgniMVyJtmg_TRANSCRIPT.txt"
+      ]
+    }
+  ]
+}

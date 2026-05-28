@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "description": "Operating defaults for Connect AI. These are POLICY DEFAULTS, not hard-coded absolutes. Registries may override per service/department so future needs don't get blocked.",
+  "mutable": false,
+  "host": {
+    "defaultHostPolicy": "127.0.0.1",
+    "allowOverride": true,
+    "reason": "localhost resolves to IPv6 (::1) on Windows and mismatches Docker port-forwarding -> timeouts. Default to 127.0.0.1, but a service may declare an override in tool-registry/port-registry when genuinely needed."
+  },
+  "localModel": {
+    "defaultLocalModelTier": "<=8b",
+    "allowLargeModelWithApproval": true,
+    "reason": "8GB VRAM (RTX 5070 Laptop). Models >8b (14b~9GB, 20b~13GB) spill to CPU and can starve other agents/MCP of GPU. Allow larger models only with explicit user approval, ideally when other agents are idle."
+  },
+  "overrideSchema": {
+    "perServiceHostOverride": "tool-registry.json item may add { \"host\": \"...\", \"hostOverrideApproved\": true }",
+    "perDeptModelOverride": "project-registry.json department may add { \"modelTier\": \"14b\", \"largeModelApproved\": true }"
+  },
+  "notes": "Designed by Claude (brain). Keeps 127.0.0.1 / 8b as safe defaults while leaving an explicit, auditable override path. Codex wires the loader to read defaults here and apply registry overrides."
+}

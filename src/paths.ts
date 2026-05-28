@@ -1,6 +1,6 @@
 /* v2.89.66 — 경로 유틸리티 모듈.
  *
- * 두뇌 폴더(`~/.connect-ai-brain/`) 와 회사 폴더(`<brain>/_company/` 또는 detached path) 의
+ * 두뇌 폴더(`~/.connect-ai-brain/`) 와 회사 폴더(`~/connect-ai-runtime/company` 또는 explicit path) 의
  * 위치를 결정하는 함수들. 분리 이유:
  * - tracker, telegram, github-sync 등 여러 모듈이 이 경로 함수들을 의존
  * - extension.ts에 두면 의존성이 한 점에 모이는데 그 한 점이 25,000줄이라 import
@@ -58,12 +58,12 @@ export function _isBrainDirExplicitlySet(): boolean {
     } catch { return false; }
 }
 
-/** 회사 폴더 위치. settings.json `companyDir` 우선 (별도 위치). 없으면 `<brain>/_company/`. */
+/** 회사 폴더 위치. settings.json `companyDir` 우선. 없으면 vault 밖 runtime으로 둔다. */
 export function getCompanyDir(): string {
     try {
         const raw = vscode.workspace.getConfiguration('connectAiLab').get<string>('companyDir', '') || '';
         const resolved = _resolvePathInput(raw);
         if (resolved) return resolved;
     } catch { /* config unavailable in some hot paths — fall through */ }
-    return path.join(_getBrainDir(), COMPANY_SUBDIR);
+    return path.join(os.homedir(), 'connect-ai-runtime', 'company');
 }

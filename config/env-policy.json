@@ -1,0 +1,75 @@
+{
+  "version": 2,
+  "description": "Env SAFETY policy for Connect AI. This is NOT a feature for reading values. It defines what may be read, and what must NEVER be output, across adapters AND all Connect AI surfaces (Output Channel, Markdown reports, webview, logs).",
+  "mutable": false,
+  "threeLayerProtection": {
+    "1_readDeny": "Never read forbidden vars or forbiddenFiles at all.",
+    "2_redaction": "Even allowed-to-read vars are masked as '***' in every output surface. Forbidden vars are masked unconditionally.",
+    "3_approvalGate": "Any adapter run() that would pass env to a child process requires user approval (approvalRequiredForRun)."
+  },
+  "appliesTo": ["adapter env passthrough", "VS Code Output Channel", "Markdown report", "webview logs", "debug logs", "error messages"],
+  "matching": {
+    "target": "environment variable NAME (not value)",
+    "caseSensitive": false,
+    "patternType": "glob (* = any run of chars)"
+  },
+  "handling": {
+    "default": "deny",
+    "onViolation": "mask-and-warn",
+    "maskedRepresentation": "only { name, exists: bool, value: '***' } — raw value never leaves this boundary"
+  },
+  "global": {
+    "readableAllow": [
+      "*_BASE_URL", "*_HOST", "*_PORT", "*_MODEL", "*_MODEL_NAME", "*_TIMEOUT",
+      "*_ROOT", "*_DIR", "*_PATH", "*_ENV", "*_MODE", "*_LOG_LEVEL", "*_DASHBOARD_URL",
+      "CONNECT_AI_*", "OLLAMA_BASE_URL", "LMSTUDIO_BASE_URL", "N8N_BASE_URL", "DASHBOARD_BASE_URL"
+    ],
+    "conditionalAllow": {
+      "patterns": ["CODEX_*", "ANTIGRAVITY_*", "OPENCLAW_*"],
+      "rule": "Allowed ONLY if the name contains none of forbiddenNameWords. Otherwise deny."
+    },
+    "forbiddenNameWords": [
+      "KEY", "SECRET", "TOKEN", "PASSWORD", "COOKIE", "SESSION", "AUTH",
+      "CREDENTIAL", "PRIVATE", "ACCOUNT", "ORDER", "BROKER", "KIS"
+    ],
+    "forbiddenPrint": [
+      "*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*", "*PASS*", "*COOKIE*", "*SESSION*",
+      "*AUTH*", "*CREDENTIAL*", "*PRIVATE*", "*CLIENT_SECRET*", "*REFRESH_TOKEN*",
+      "*ACCESS_TOKEN*", "*ACCOUNT*", "*ORDER*", "*BROKER*", "*KIS*",
+      "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLIENT_SECRET",
+      "PAYPAL_SECRET", "PAYPAL_CLIENT_SECRET", "GITHUB_TOKEN", "VERCEL_TOKEN",
+      "SUPABASE_SERVICE_ROLE_KEY"
+    ],
+    "forbiddenFiles": [
+      ".env", ".env.*", "credentials.json", "google_token.json", ".credentials.json",
+      "*.pem", "*.key", "service-account*.json"
+    ]
+  },
+  "departments": {
+    "connect-ai": {
+      "readableAllowExtra": ["CONNECT_AI_*", "OLLAMA_BASE_URL", "LMSTUDIO_BASE_URL", "N8N_BASE_URL"],
+      "forbiddenNote": "No external API keys, payment keys, or OAuth tokens."
+    },
+    "job-search": {
+      "readableAllowExtra": ["JOB_SEARCH_*"],
+      "forbiddenNote": "credentials.json, google_token.json, Gmail/Sheets OAuth tokens are forbidden (read + print)."
+    },
+    "stock-research": {
+      "readableAllowExtra": ["*_REPORT_DIR", "*_DATA_DIR", "*_MODEL", "*_OUTPUT_DIR"],
+      "forbiddenNote": "KIS, broker, account, order, token, appsecret, live-trading vars forbidden. Treat even the EXISTENCE of these vars as sensitive — do not report exists:true for them."
+    },
+    "ai-tool-research": {
+      "readableAllowExtra": ["*_SEARCH_MODE", "*_SOURCE_DIR", "*_DASHBOARD_URL", "*_MODEL"],
+      "forbiddenNote": "Keyed search API keys forbidden: Tavily, Exa, Perplexity, SerpAPI."
+    },
+    "digital-nomad": {
+      "readableAllowExtra": ["*_SITE_DIR", "*_PORT", "*_MODEL"],
+      "forbiddenNote": "YouTube OAuth, Google API, AdSense, PayPal secrets forbidden."
+    },
+    "youtube-intelligence": {
+      "readableAllowExtra": ["*_DIR", "*_PORT", "*_MODEL"],
+      "forbiddenNote": "YouTube OAuth, Google API tokens forbidden."
+    }
+  },
+  "notes": "Designed by Claude (brain). readableAllow is intentionally narrow — add real vars only when a concrete need appears. Codex reviews, then selectively migrates into antigravity-projects/connect-ai/config/env-policy.json and enforces layers 2-3 in the loader + Output/redaction layer."
+}
