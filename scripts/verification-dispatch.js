@@ -66,6 +66,8 @@ function sourceIdFromText(text) {
 function exactVerdictToken(value) {
   const token = String(value || "")
     .trim()
+    .replace(/^([*_`~]+)(.+?)\1$/, "$2")
+    .trim()
     .toLowerCase()
     .replace(/[\s-]+/g, "_");
   if (token === "reject") return "reject";

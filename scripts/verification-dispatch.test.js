@@ -609,6 +609,22 @@ test("verdict parser accepts exact token on next line after option heading", () 
   assert.equal(dispatch.hasVerifierRequiredEvidence({ resultSummary: summary }), true);
 });
 
+test("verdict parser accepts markdown-emphasized exact token after option heading", () => {
+  const summary = [
+    "### 검증 판정: accept|reject|needs_human",
+    "**accept**",
+    "",
+    "### 근거:",
+    "현재 evidence pack과 테스트 요약을 확인했습니다.",
+    "",
+    "### 누락 증거:",
+    "없음.",
+  ].join("\n");
+
+  assert.equal(dispatch.verdictFromSummary(summary), "accept");
+  assert.equal(dispatch.hasVerifierRequiredEvidence({ resultSummary: summary }), true);
+});
+
 test("verdict parser accepts wrapped worker output with numbered verdict label", () => {
   const summary = [
     "BLOCKED: verifier output missing explicit verifier verdict. Output: 1. 검증결과: needs_human",
