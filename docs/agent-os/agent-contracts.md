@@ -31,6 +31,7 @@ The contract must define:
 | `gemini-verifier` | Gemini | independent verification | read-only except runtime review output |
 | `antigravity-architecture-reviewer` | Antigravity | architecture critique | read-only except runtime review output |
 | `hermes-observer` | Hermes | observation and low-cost coordination | read-only except runtime observer output |
+| `hermes-orchestrator` | Hermes | guarded dispatch/queue only (no approval, no writes) | runtime orchestration output only |
 | `local-llm-smoke` | local LLM | cheap short classification | read-only except runtime smoke output |
 | `vault-writer` | vault writer | single durable Obsidian write path | allowed vault folders only, policy-checked |
 | `browser-smoke` | Browser or Chrome | UI/runtime smoke evidence | read-only except runtime smoke output |

@@ -314,6 +314,63 @@
       "doneRule": "Observer output only; never DONE for implementation or approval tasks"
     },
     {
+      "id": "hermes-orchestrator",
+      "role": "orchestrator",
+      "assignee": "hermes",
+      "workerClass": "orchestrator",
+      "riskClassMax": "Yellow",
+      "authority": {
+        "canWriteRepo": false,
+        "canWriteRuntimeCompanyDir": true,
+        "canWriteVaultDirectly": false,
+        "canApproveHumanGates": false,
+        "canCloseDoneWithoutVerifier": false
+      },
+      "allowedWriteScopes": [
+        "${COMPANY_DIR}/orchestration-output"
+      ],
+      "forbiddenPaths": [
+        "${VAULT_ROOT}/**",
+        "approval closure",
+        "credential, token, broker, live-trade, deploy, external-send paths"
+      ],
+      "inputRequired": [
+        "goal",
+        "targetExecutor",
+        "riskClass",
+        "writeScope",
+        "queueItemId"
+      ],
+      "outputRequired": [
+        "dispatchedQueueItemId",
+        "targetExecutor",
+        "riskClass",
+        "status=dispatched",
+        "noApprovalClaimed"
+      ],
+      "evidenceRequired": [
+        "created queue item id",
+        "target executor",
+        "non-secret dispatch summary"
+      ],
+      "expectedTests": [
+        "node --test scripts/mcp-task-dispatch.test.js when dispatch wiring changes"
+      ],
+      "tokenBudget": "short",
+      "retryBudget": 0,
+      "stopConditions": [
+        "task asks to approve or close an approval gate",
+        "task requires repo or vault writes",
+        "task enters credential or external send boundary"
+      ],
+      "humanApprovalRequiredWhen": [
+        "any approval-gate closure",
+        "Red risk dispatch",
+        "credential or external account access"
+      ],
+      "doneRule": "Dispatch/queue output only; never approves gates or closes DONE without verifier"
+    },
+    {
       "id": "local-llm-smoke",
       "role": "local-smoke",
       "assignee": "local-llm",

@@ -8,8 +8,8 @@ const envPaths = require("./env-paths.js");
 const repoRoot = envPaths.repoRoot();
 const configPath = path.join(repoRoot, "config", "agent-contracts.json");
 
-const ALLOWED_ROLES = new Set(["implementer", "reviewer", "researcher", "verifier", "local-smoke"]);
-const ALLOWED_WORKER_CLASSES = new Set(["executor", "reviewer", "observer", "local-smoke", "single-writer", "ui-smoke"]);
+const ALLOWED_ROLES = new Set(["implementer", "reviewer", "researcher", "verifier", "local-smoke", "orchestrator"]);
+const ALLOWED_WORKER_CLASSES = new Set(["executor", "reviewer", "observer", "local-smoke", "single-writer", "ui-smoke", "orchestrator"]);
 const ALLOWED_RISK = new Set(["Green", "Yellow", "Red"]);
 const REQUIRED_CONTRACT_FIELDS = [
   "id",
@@ -47,6 +47,7 @@ const EXPECTED_CONTRACT_IDS = [
   "vault-writer",
   "browser-smoke",
   "coderabbit-review-gate",
+  "hermes-orchestrator",
 ];
 const DONE_RULE_TERMS = [
   "filesChanged",

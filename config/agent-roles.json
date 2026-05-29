@@ -8,7 +8,7 @@
     "ceo": {
       "executor": "hermes",
       "status": "active",
-      "primaryNotes": ["wiki/projects/Connect AI.md", "wiki/tools/정책 게이트.md"],
+      "primaryNotes": ["wiki/projects/Connect AI.md", "wiki/tools/정책 게이트.md", "agent-guides/CEO.md"],
       "allowedTools": ["memory_list", "memory_read", "gate_check", "audit_recent", "everything_search", "task_list", "task_enqueue", "task_dispatch_goal", "task_dispatch_verification", "task_apply_verification", "task_update_status", "task_claim"],
       "approvalTools": ["memory_write_decision"],
       "forbiddenTools": ["lilys_ingest_youtube_url", "youtube_ingest"],
@@ -19,7 +19,7 @@
     "youtube": {
       "executor": "hermes->codex",
       "status": "active",
-      "primaryNotes": ["wiki/projects/유튜브.md", "youtube/runbook-lilys-login-automation.md"],
+      "primaryNotes": ["wiki/projects/유튜브.md", "youtube/runbook-lilys-login-automation.md", "agent-guides/youtube.md"],
       "allowedTools": ["memory_list", "memory_read", "gate_check", "everything_search", "lilys_session_check"],
       "approvalTools": ["lilys_ingest_youtube_url", "youtube_ingest", "memory_write_decision"],
       "forbiddenTools": [],
@@ -52,8 +52,8 @@
     "developer": {
       "executor": "codex",
       "status": "active",
-      "primaryNotes": ["wiki/tools/Codex.md", "runbooks/hermes-cost-policy.md"],
-      "allowedTools": ["memory_list", "memory_read", "gate_check", "audit_recent", "everything_search", "task_dispatch_goal"],
+      "primaryNotes": ["wiki/tools/Codex.md", "runbooks/hermes-cost-policy.md", "agent-guides/developer.md"],
+      "allowedTools": ["memory_list", "memory_read", "gate_check", "audit_recent", "everything_search"],
       "approvalTools": ["memory_write_decision"],
       "forbiddenTools": ["lilys_ingest_youtube_url", "youtube_ingest"],
       "riskLevel": "medium",
@@ -74,7 +74,7 @@
     "secretary": {
       "executor": "hermes",
       "status": "optional",
-      "primaryNotes": [],
+      "primaryNotes": ["agent-guides/Secretary.md"],
       "allowedTools": ["memory_list", "memory_read", "gate_check", "audit_recent", "task_list", "task_dispatch_goal", "task_dispatch_verification", "task_apply_verification", "task_update_status", "task_claim"],
       "approvalTools": ["memory_write_decision"],
       "forbiddenTools": ["lilys_ingest_youtube_url", "youtube_ingest"],
@@ -96,7 +96,7 @@
     "writer": {
       "executor": "claude->codex",
       "status": "optional",
-      "primaryNotes": ["wiki/tools/작업 파이프라인.md", "wiki/projects/유튜브.md"],
+      "primaryNotes": ["wiki/tools/작업 파이프라인.md", "wiki/projects/유튜브.md", "agent-guides/writer.md"],
       "allowedTools": ["memory_list", "memory_read", "gate_check", "everything_search"],
       "approvalTools": ["memory_write_decision"],
       "forbiddenTools": ["lilys_ingest_youtube_url", "youtube_ingest"],
@@ -107,13 +107,24 @@
     "researcher": {
       "executor": "claude->codex",
       "status": "active",
-      "primaryNotes": ["wiki/projects/AI도구 리서치.md", "wiki/tools/Everything 검색.md"],
+      "primaryNotes": ["wiki/projects/AI도구 리서치.md", "wiki/tools/Everything 검색.md", "agent-guides/researcher.md"],
       "allowedTools": ["memory_list", "memory_read", "gate_check", "everything_search"],
       "approvalTools": ["memory_write_decision"],
       "forbiddenTools": ["lilys_ingest_youtube_url", "youtube_ingest"],
       "riskLevel": "low",
       "nextAction": "Everything 검색과 vault 근거를 연결해 리서치 결과를 검증한다.",
       "uiBadges": ["research", "evidence"]
+    },
+    "verifier": {
+      "executor": "gemini",
+      "status": "active",
+      "primaryNotes": ["agent-guides/검토 에이전트.md"],
+      "allowedTools": ["memory_list", "memory_read", "gate_check", "audit_recent", "everything_search"],
+      "approvalTools": [],
+      "forbiddenTools": ["memory_write_decision", "lilys_ingest_youtube_url", "youtube_ingest"],
+      "riskLevel": "low",
+      "nextAction": "executor 결과를 evidence 기반으로 검증하고 accept/reject/needs_human verdict만 낸다.",
+      "uiBadges": ["verifier", "read-only", "quality-gate"]
     }
   }
 }

@@ -13,6 +13,7 @@ const {
   moveRootNote,
   normalizeVaultRelPath,
   repairExistingNote,
+  replaceExistingNoteContent,
   rollbackRootMoves,
   writeDurableNote,
 } = require("./vault-writer.js");
@@ -397,6 +398,129 @@ test("vault writer rejects root migration when target basename would break wiki 
 
   assert.equal(result.ok, false);
   assert.match(result.reason, /basename/);
+});
+
+test("buildFrontmatter emits roleKey only when provided", () => {
+  const withRole = buildFrontmatter({
+    type: "agent",
+    status: "active",
+    roleKey: "youtube",
+    project: "Connect AI",
+    owner: "codex",
+    source: "test",
+    links: ["[[00_MOC/Agents]]"],
+  });
+  assert.match(withRole, /^---\ntype: agent\nstatus: active\nroleKey: youtube\ntags:/m);
+
+  const withoutRole = buildFrontmatter({
+    type: "agent",
+    status: "active",
+    project: "Connect AI",
+    owner: "codex",
+    source: "test",
+    links: ["[[00_MOC/Agents]]"],
+  });
+  assert.doesNotMatch(withoutRole, /roleKey:/);
+  assert.match(withoutRole, /^---\ntype: agent\nstatus: active\ntags:/m);
+});
+
+test("vault writer writes a new persona note carrying roleKey frontmatter", () => {
+  const memoryRoot = tempRoot("connect-ai-vault-writer-vault-");
+  const storageRoot = tempRoot("connect-ai-vault-writer-store-");
+
+  const result = writeDurableNote({
+    memoryRoot,
+    storageRoot,
+    relPath: "agent-guides/youtube.md",
+    title: "youtube",
+    type: "agent",
+    status: "active",
+    roleKey: "youtube",
+    project: "Connect AI",
+    owner: "codex",
+    source: "test",
+    links: ["[[00_MOC/Agents]]"],
+    tags: ["agent"],
+    related: ["[[00_MOC/Agents]]"],
+    body: "# youtube\n\n실체: [[Hermes]] 단독\n",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.wrote, true);
+  const onDisk = fs.readFileSync(result.path, "utf8");
+  assert.match(onDisk, /^---\ntype: agent\nstatus: active\nroleKey: youtube\n/m);
+  assert.match(onDisk, /실체: \[\[Hermes\]\] 단독/);
+});
+
+test("vault writer accepts the optional status used by mirror persona notes", () => {
+  const memoryRoot = tempRoot("connect-ai-vault-writer-vault-");
+  const storageRoot = tempRoot("connect-ai-vault-writer-store-");
+
+  const result = writeDurableNote({
+    memoryRoot,
+    storageRoot,
+    relPath: "agent-guides/writer.md",
+    title: "writer",
+    type: "agent",
+    status: "optional",
+    roleKey: "writer",
+    project: "Connect AI",
+    owner: "claude",
+    source: "test",
+    links: ["[[00_MOC/Agents]]"],
+    tags: ["agent"],
+    related: ["[[00_MOC/Agents]]"],
+    body: "# writer\n\n실체: [[Claude]] 단독\n",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.wrote, true);
+  assert.match(fs.readFileSync(result.path, "utf8"), /status: optional/);
+});
+
+test("vault writer replaces an existing note and keeps a backup", () => {
+  const memoryRoot = tempRoot("connect-ai-vault-writer-vault-");
+  const storageRoot = tempRoot("connect-ai-vault-writer-store-");
+  const notePath = path.join(memoryRoot, "agent-guides", "검토 에이전트.md");
+  fs.mkdirSync(path.dirname(notePath), { recursive: true });
+  const original = "# 검토 에이전트\nthin legacy note\n";
+  fs.writeFileSync(notePath, original, "utf8");
+
+  const replacement = "---\ntype: agent\nstatus: active\nroleKey: verifier\n---\n# 검토 에이전트\n\n실체: [[Gemini]] 단독\n";
+
+  const dryRun = replaceExistingNoteContent({
+    memoryRoot,
+    storageRoot,
+    batchId: "replace-test",
+    relPath: "agent-guides/검토 에이전트.md",
+    content: replacement,
+    dryRun: true,
+  });
+  assert.equal(dryRun.ok, true);
+  assert.equal(dryRun.wrote, false);
+  assert.equal(fs.readFileSync(notePath, "utf8"), original);
+
+  const applied = replaceExistingNoteContent({
+    memoryRoot,
+    storageRoot,
+    batchId: "replace-test",
+    relPath: "agent-guides/검토 에이전트.md",
+    content: replacement,
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.wrote, true);
+  assert.match(fs.readFileSync(notePath, "utf8"), /roleKey: verifier/);
+  assert.equal(fs.readFileSync(applied.backupPath, "utf8"), original);
+
+  const missing = replaceExistingNoteContent({
+    memoryRoot,
+    storageRoot,
+    batchId: "replace-test",
+    relPath: "agent-guides/does-not-exist.md",
+    content: replacement,
+  });
+  assert.equal(missing.ok, false);
+  assert.match(missing.reason, /note_not_found/);
 });
 
 test("vault writer rolls back approved root migrations from manifest", () => {
